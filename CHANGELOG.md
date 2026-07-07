@@ -1,5 +1,23 @@
 # Change Log
 
+## [1.2.0] - 2026-07-11
+
+### Added
+
+- Multi-arch Docker image builds for `amd64` and `arm64` (Apple M1/M2 hosts).
+- Host OS support for Ubuntu, Windows, and macOS via Docker Desktop.
+- `sysroot-fix-append.template.yaml`, a tracked template seeded on container start to the gitignored `sysroot-fix-append.yaml` when it is missing. This gives users a discoverable, frictionless place to add their own sysroot fixups that auto-update never overwrites or conflicts with (see README "Adding your own sysroot fixups").
+
+### Changed
+
+- On start, `entrypoint.sh` now updates the container to the latest `vX.Y.Z` release tag, so containers track vetted releases. Falls back to the toolchain baked into the image when offline or when no tag is available.
+- The auto-update no longer silently discards local edits to tracked toolchain files. It now stashes and re-applies them on top of the release; a clean re-apply is kept, and a conflicting one leaves git conflict markers for the user to resolve (see README "Resolving toolchain update conflicts"). The container still starts either way.
+- The released image now bakes in the latest release tag at build time; set the `TOOLCHAIN_REF` build-arg to pin a specific ref.
+
+### Fixed
+
+- Auto-update no longer overwrites *untracked* user files in the toolchain directory. If a new release would add a tracked file with the same name as an untracked local file, the update is skipped with a warning instead of force-checking out over it; non-colliding untracked files never block the update. The entrypoint-generated `cross.cmake` is now gitignored so a pristine container keeps taking the fast clean-tree update path.
+
 ## [1.1.0] - 2026-05-11
 
 ### Added
