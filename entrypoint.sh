@@ -83,8 +83,9 @@ if [ -d "$TOOLCHAIN_DIR/.git" ]; then
     echo "[WARN] No published release resolved (offline / none) — using local toolchain."
   elif ! timeout 15 git fetch --force origin "refs/tags/$latest:refs/tags/$latest" >/dev/null 2>&1; then
     echo "[WARN] Could not fetch release $latest — using local toolchain."
-  elif git diff --quiet HEAD 2>/dev/null; then
-    # Clean toolchain tree — safe to force straight to the release.
+  elif [ -z "$(git status --porcelain 2>/dev/null)" ]; then
+    # Fully clean toolchain tree (no tracked edits, no untracked files) —
+    # nothing user-made can be lost, safe to force straight to the release.
     if git checkout -q -f "$latest" >/dev/null 2>&1; then
       echo "[INFO] Toolchain checked out release $latest."
       updated=1
@@ -92,16 +93,29 @@ if [ -d "$TOOLCHAIN_DIR/.git" ]; then
       echo "[WARN] Checkout of $latest failed — using local toolchain."
     fi
   else
-    # The user has edited tracked toolchain files. NEVER discard those edits:
-    # stash them, move to the release, then re-apply on top. A clean re-apply
-    # keeps the edits; a conflicting one leaves standard git conflict markers
-    # in the tree for the user to resolve by hand (README: "Resolving toolchain
-    # update conflicts") and retains the stash as a safety copy. Either way the
+    # The user has edited tracked files and/or added untracked ones. NEVER
+    # discard either: stash tracked edits, move to the release with a NON-force
+    # checkout (git refuses to overwrite untracked files, so a collision fails
+    # safe), then re-apply the stash on top. A clean re-apply keeps the edits;
+    # a conflicting one leaves standard git conflict markers in the tree for
+    # the user to resolve by hand (README: "Resolving toolchain update
+    # conflicts") and retains the stash as a safety copy. Either way the
     # container still finishes starting.
-    echo "[INFO] Local toolchain edits detected — preserving them across update to $latest..."
-    if git stash push -q >/dev/null 2>&1; then
+    echo "[INFO] Local toolchain changes detected — preserving them across update to $latest..."
+    stashed=0
+    if ! git diff --quiet HEAD 2>/dev/null; then
+      if git stash push -q >/dev/null 2>&1; then
+        stashed=1
+      else
+        echo "[WARN] Could not stash local edits — kept your local toolchain unchanged."
+      fi
+    fi
+    if [ "$stashed" -eq 1 ] || git diff --quiet HEAD 2>/dev/null; then
       if git checkout -q "$latest" >/dev/null 2>&1; then
-        if git stash pop >/dev/null 2>&1; then
+        if [ "$stashed" -eq 0 ]; then
+          echo "[INFO] Toolchain checked out release $latest (untracked files kept)."
+          updated=1
+        elif git stash pop >/dev/null 2>&1; then
           echo "[INFO] Toolchain updated to $latest; your local edits re-applied cleanly."
           updated=1
         else
@@ -113,13 +127,12 @@ if [ -d "$TOOLCHAIN_DIR/.git" ]; then
           echo "[WARN] See README 'Resolving toolchain update conflicts'. Update left unfinished."
         fi
       else
-        # Could not reach the release (e.g. an untracked file blocks the
-        # checkout) — re-apply the stash so the toolchain is exactly as before.
-        git stash pop >/dev/null 2>&1 || true
-        echo "[WARN] Could not check out $latest — kept your local toolchain unchanged."
+        # Could not reach the release (e.g. an untracked file would be
+        # overwritten by it) — re-apply the stash so the toolchain is exactly
+        # as before.
+        [ "$stashed" -eq 1 ] && { git stash pop >/dev/null 2>&1 || true; }
+        echo "[WARN] Could not check out $latest (an untracked file may be in the way) — kept your local toolchain unchanged."
       fi
-    else
-      echo "[WARN] Could not stash local edits — kept your local toolchain unchanged."
     fi
   fi
 

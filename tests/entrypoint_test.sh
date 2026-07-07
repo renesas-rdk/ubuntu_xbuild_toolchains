@@ -9,9 +9,11 @@
 # container. Offline, an unresolvable release, a remote whose tag cannot be
 # fetched, or a failing post-update step must all fall through to a warning and
 # let startup complete with the toolchain wrappers on PATH. A second contract:
-# local edits to tracked toolchain files are NEVER silently discarded — they are
-# stashed and re-applied on top of the release, and a conflicting re-apply leaves
-# git conflict markers for the user (cases 6 & 7). Case 8 covers seeding the
+# local changes — edits to tracked toolchain files AND untracked user files —
+# are NEVER silently discarded. Tracked edits are stashed and re-applied on top
+# of the release, and a conflicting re-apply leaves git conflict markers for the
+# user (cases 6 & 7); an untracked file that a new release would overwrite makes
+# the update fail safe instead (cases 9 & 10). Case 8 covers seeding the
 # gitignored sysroot-fix-append.yaml from its template without clobbering edits.
 #
 # The entrypoint is driven DIRECTLY (not through a built image) against a
@@ -307,5 +309,53 @@ out="$(run_entry "$base")"
 assert_not_contains "$out" "Seeded sysroot-fix-append.yaml from template"
 grep -q "my_pkg" "$tc/sysroot-fix-append.yaml" \
     && _pass "$CURRENT_TEST" || _fail "$CURRENT_TEST" "user edit was overwritten"
+
+# =============================================================================
+# 9. An untracked user file that the release would OVERWRITE is never clobbered
+#    — the update is skipped instead (fail safe).
+# =============================================================================
+base="$(make_sandbox)"
+tc="$base/toolchains"
+tag_remote "$base" "v1.0.0" "release-one"        # the release adds tracked RELEASE_CHANGE
+set_latest_release "$base" "v1.0.0"
+# The user created a file with the same name, untracked, BEFORE the update.
+printf 'precious user data\n' >"$tc/RELEASE_CHANGE"
+before="$(git -C "$tc" rev-parse HEAD)"
+
+it "9.1 colliding untracked file -> update skipped with a warning, startup completes"
+out="$(run_entry "$base")"
+assert_contains "$out" "Could not check out v1.0.0"
+assert_not_contains "$out" "checked out release v1.0.0"
+assert_contains "$out" "--- Startup Complete ---"
+
+it "9.2 the untracked user file's content is untouched"
+grep -q "precious user data" "$tc/RELEASE_CHANGE" \
+    && _pass "$CURRENT_TEST" || _fail "$CURRENT_TEST" "untracked file was clobbered by the release"
+
+it "9.3 HEAD stayed put — the toolchain is exactly as before"
+[ "$(git -C "$tc" rev-parse HEAD)" = "$before" ] \
+    && _pass "$CURRENT_TEST" || _fail "$CURRENT_TEST" "HEAD moved despite the skipped update"
+
+# =============================================================================
+# 10. A NON-colliding untracked user file does not block the update and survives
+# =============================================================================
+base="$(make_sandbox)"
+tc="$base/toolchains"
+tag_remote "$base" "v1.0.0" "release-one"
+set_latest_release "$base" "v1.0.0"
+printf 'my scratch notes\n' >"$tc/my-notes.txt"   # untracked, not in the release
+
+it "10.1 non-colliding untracked file -> release checked out, startup completes"
+out="$(run_entry "$base")"
+assert_contains "$out" "checked out release v1.0.0"
+assert_contains "$out" "--- Startup Complete ---"
+
+it "10.2 HEAD advanced to the release tag"
+[ "$(git -C "$tc" rev-parse HEAD)" = "$(git -C "$tc" rev-parse v1.0.0)" ] \
+    && _pass "$CURRENT_TEST" || _fail "$CURRENT_TEST" "HEAD is not at v1.0.0"
+
+it "10.3 the untracked user file survived the update"
+grep -q "my scratch notes" "$tc/my-notes.txt" \
+    && _pass "$CURRENT_TEST" || _fail "$CURRENT_TEST" "untracked file was lost"
 
 finish
