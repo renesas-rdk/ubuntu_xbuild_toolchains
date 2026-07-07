@@ -1,0 +1,33 @@
+# === User-local sysroot fixups (sysroot-fix-append.yaml) ===
+#
+# Put YOUR OWN sysroot relocation fixups here instead of editing the tracked
+# `sysroot-fix.yaml`. This file is gitignored, so:
+#   * container auto-update NEVER overwrites it and NEVER conflicts with it, and
+#   * it is seeded from this template only when missing (your edits are safe).
+#
+# The `sysroot-fix` tool loads `sysroot-fix.yaml` first, then merges the rules
+# from this file on top. Rules here are ADDITIVE — use this file to add fixups
+# for packages the shipped `sysroot-fix.yaml` does not cover yet.
+#
+# ---------------------------------------------------------------------------
+# HOW TO ADD A FIXUP
+#   1) Find the broken absolute path in the sysroot CMake export file, e.g.:
+#        grep -RIn "/opt/ros/${ROS_DISTRO}" \
+#          ${ARM64_SYSROOT}/opt/ros/${ROS_DISTRO}/lib/aarch64-linux-gnu/cmake/<pkg>
+#   2) Add an entry below (${ARM64_SYSROOT} and ${ROS_DISTRO} are expanded by the
+#      sysroot-fix tool — you do not set them here):
+#        <package_name>:
+#          - file: "<path relative to ARM64_SYSROOT, or an absolute path>"
+#            find: "<string to replace>"
+#            replace: "<replacement, usually ${_IMPORT_PREFIX} or ${_IMPORT_PREFIX}/../../..>"
+#   3) Apply it (editing this file does NOT auto-apply on restart):
+#        sysroot-fix        # patches the sysroot now (main + append rules)
+#      then rebuild.
+# ---------------------------------------------------------------------------
+#
+# Example (delete the leading '#' and adapt):
+#
+# some_package:
+#   - file: "${ARM64_SYSROOT}/opt/ros/${ROS_DISTRO}/lib/aarch64-linux-gnu/cmake/some_package/some_packageTargets-none.cmake"
+#     find: "/opt/ros/${ROS_DISTRO}"
+#     replace: "${_IMPORT_PREFIX}"

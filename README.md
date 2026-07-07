@@ -53,7 +53,8 @@ applications for the target board.
 | `arm64-chroot.sh` | Enters the ARM64 sysroot via QEMU + `chroot` (used to run `rosdep`/`apt` against the target). |
 | `sysroot-rosdep-install.sh` | Copies the ROS 2 workspace into the sysroot and installs build-time dependencies with `rosdep`. |
 | `sysroot-fix.py` + `sysroot-fix.yaml` | Relocate hardcoded absolute paths in the sysroot's exported CMake target files so cross builds resolve correctly. |
-| `sysroot-fix-append.yaml` | User-local sysroot fixups; gitignored, never overwritten by auto-update. |
+| `sysroot-fix-append.template.yaml` | Tracked template for the user-local fixups file. Seeded to `sysroot-fix-append.yaml` on container start when that file is missing. |
+| `sysroot-fix-append.yaml` | User-local sysroot fixups; gitignored, seeded from the template, never overwritten by or in conflict with auto-update. |
 | `entrypoint.sh` | Container entrypoint: refreshes sysroot DNS, selects the board toolchain from `PRODUCT`, and auto-updates the toolchain to the latest `vX.Y.Z` release tag on start. |
 | `env.conf` | Bash tab-completion for `colcon` and `cross-colcon-build`. |
 
@@ -70,6 +71,70 @@ For full setup and development instructions, see the
 
 For common cross-compilation issues, see the
 [Cross-compilation FAQ](https://renesas-rdk.github.io/rzv2h_rdk_documentation/latest/chapter-4/development_guide/cross_build_faq.html).
+
+### Adding your own sysroot fixups
+
+If a cross build fails with an error like *"references the file … but this file
+does not exist"*, a sysroot CMake export file has a hardcoded absolute path that
+needs relocating. Add the fixup in **`sysroot-fix-append.yaml`**, not in the
+tracked `sysroot-fix.yaml`:
+
+- `sysroot-fix-append.yaml` is gitignored and seeded from
+  `sysroot-fix-append.template.yaml` on container start. Because git never tracks
+  it, auto-update **never overwrites it and never conflicts with it** — your
+  rules survive every update and every restart, no manual merge ever needed.
+- The `sysroot-fix` tool loads `sysroot-fix.yaml` first, then merges your append
+  rules on top. Use the append file to **add** fixups for packages the shipped
+  file does not cover.
+
+Editing the append file does **not** apply the rules by itself — the patch runs
+against the sysroot, which persists across restarts. After adding a rule, apply
+it explicitly and rebuild:
+
+```bash
+sysroot-fix        # patches the sysroot now with main + append rules
+```
+
+Only edit the tracked `sysroot-fix.yaml` directly when you need to **change or
+override** an existing shipped rule (the append file can only add). Such edits go
+through the update-conflict handling below.
+
+### Resolving toolchain update conflicts
+
+On start the container updates `/home/ubuntu/toolchains` to the latest `vX.Y.Z`
+release tag. If you have edited tracked toolchain files, the entrypoint no longer
+discards your edits — it stashes them, checks out the release, and re-applies them
+on top:
+
+- **Clean re-apply** — your edits sit on top of the new release. You see
+  `your local edits re-applied cleanly` and nothing else is needed.
+- **Conflict** — your edits touch the same lines the release changed. The
+  entrypoint stops mid-update and prints:
+
+  ```
+  [WARN] Your local toolchain edits CONFLICT with release vX.Y.Z.
+  [WARN] Conflict markers are in the affected files. Resolve them, then run:
+  [WARN]     cd /home/ubuntu/toolchains && git stash drop
+  ```
+
+  The container still finishes starting, but the conflicted files contain
+  standard git conflict markers (`<<<<<<<` / `=======` / `>>>>>>>`) and must be
+  fixed by hand. From a shell inside the container:
+
+  ```bash
+  cd /home/ubuntu/toolchains
+  git status                 # list the conflicted files
+  # edit each file, keeping the changes you want and removing the markers
+  git stash drop             # discard the safety copy once you are satisfied
+  ```
+
+  Your stashed edits are kept as a safety copy until you run `git stash drop`, so
+  nothing is lost. To instead throw away your local edits and take the release
+  as-is, run `git checkout -f <tag> && git stash drop`.
+
+To avoid conflicts entirely, contribute lasting changes as a release rather than
+editing files in the container: edits to tracked files that overlap a future
+release will need to be resolved on every affected update.
 
 ## Limitations
 

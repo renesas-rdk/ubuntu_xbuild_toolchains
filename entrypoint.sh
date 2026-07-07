@@ -53,29 +53,74 @@ for pair in \
   [ -f "$src" ] && sudo ln -sf "$src" "$dst"
 done
 
-# === Auto-update: check out the latest vX.Y.Z release tag; never block container ===
-# Users track vetted releases, not the moving `main` branch. A bad commit on main
-# no longer reaches containers on restart — only a maintainer-cut release does.
-# Offline / no-tag / checkout failure is non-fatal: the container keeps the
-# toolchain baked into the image (itself a valid release).
+# === Auto-update: check out the latest PUBLISHED release; never block container ===
+# Users track vetted releases, not the moving `main` branch, and not raw tags:
+# the release is resolved from the GitHub Releases API, so a pushed-but-failing
+# tag (which has no release yet) never reaches containers — only a release the CI
+# publishes after its tests pass does. Offline / no-release / checkout failure is
+# non-fatal: the container keeps the toolchain baked into the image (a valid release).
 if [ -d "$TOOLCHAIN_DIR/.git" ]; then
   cd "$TOOLCHAIN_DIR" || { echo "ERROR: cannot cd into $TOOLCHAIN_DIR" >&2; exit 1; }
   git config user.email "container@local" 2>/dev/null || true
   git config user.name "Container" 2>/dev/null || true
 
   updated=0
-  if timeout 15 git fetch --tags --force origin >/dev/null 2>&1; then
-    # Latest release by version sort; strict vX.Y.Z only (no pre-release tags).
-    latest="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -n1)"
-    if [ -n "$latest" ] && git checkout -q -f "$latest" >/dev/null 2>&1; then
+  # Resolve the latest PUBLISHED release from the GitHub API (excludes drafts and
+  # pre-releases). OWNER/REPO is derived from origin, stripping any embedded
+  # credentials and the .git suffix. Parsed with grep/sed so no jq is needed.
+  # TOOLCHAIN_API_BASE overrides the API host (a GitHub Enterprise mirror, or a
+  # local mock in the integration test); it defaults to the public API.
+  api_base="${TOOLCHAIN_API_BASE:-https://api.github.com}"
+  slug="$(git remote get-url origin 2>/dev/null | sed -E 's#^.*github\.com[:/]##; s#\.git$##')"
+  latest=""
+  if [ -n "$slug" ]; then
+    latest="$(timeout 15 curl -fsSL -H 'Accept: application/vnd.github+json' \
+      "$api_base/repos/$slug/releases/latest" 2>/dev/null \
+      | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
+  fi
+
+  if [ -z "$latest" ]; then
+    echo "[WARN] No published release resolved (offline / none) — using local toolchain."
+  elif ! timeout 15 git fetch --force origin "refs/tags/$latest:refs/tags/$latest" >/dev/null 2>&1; then
+    echo "[WARN] Could not fetch release $latest — using local toolchain."
+  elif git diff --quiet HEAD 2>/dev/null; then
+    # Clean toolchain tree — safe to force straight to the release.
+    if git checkout -q -f "$latest" >/dev/null 2>&1; then
       echo "[INFO] Toolchain checked out release $latest."
       updated=1
     else
-      echo "[WARN] No release tag found / checkout failed — using local toolchain."
+      echo "[WARN] Checkout of $latest failed — using local toolchain."
     fi
   else
-    # Timeout / offline — skip, container continues normally
-    echo "[WARN] Auto-update skipped (offline) — using local toolchain."
+    # The user has edited tracked toolchain files. NEVER discard those edits:
+    # stash them, move to the release, then re-apply on top. A clean re-apply
+    # keeps the edits; a conflicting one leaves standard git conflict markers
+    # in the tree for the user to resolve by hand (README: "Resolving toolchain
+    # update conflicts") and retains the stash as a safety copy. Either way the
+    # container still finishes starting.
+    echo "[INFO] Local toolchain edits detected — preserving them across update to $latest..."
+    if git stash push -q >/dev/null 2>&1; then
+      if git checkout -q "$latest" >/dev/null 2>&1; then
+        if git stash pop >/dev/null 2>&1; then
+          echo "[INFO] Toolchain updated to $latest; your local edits re-applied cleanly."
+          updated=1
+        else
+          # stash pop hit a conflict: HEAD is on the release, conflict markers
+          # are in the tree, and the stash is kept so nothing is lost.
+          echo "[WARN] Your local toolchain edits CONFLICT with release $latest."
+          echo "[WARN] Conflict markers are in the affected files. Resolve them, then run:"
+          echo "[WARN]     cd $TOOLCHAIN_DIR && git stash drop"
+          echo "[WARN] See README 'Resolving toolchain update conflicts'. Update left unfinished."
+        fi
+      else
+        # Could not reach the release (e.g. an untracked file blocks the
+        # checkout) — re-apply the stash so the toolchain is exactly as before.
+        git stash pop >/dev/null 2>&1 || true
+        echo "[WARN] Could not check out $latest — kept your local toolchain unchanged."
+      fi
+    else
+      echo "[WARN] Could not stash local edits — kept your local toolchain unchanged."
+    fi
   fi
 
   if [ "$updated" -eq 1 ]; then
@@ -138,6 +183,19 @@ PYMERGE
   else
     echo "[WARN] python3 not found — skipping settings.json template merge."
   fi
+fi
+
+# === Seed the user-local sysroot fixups file from its template (if missing) ===
+# sysroot-fix-append.yaml is gitignored: auto-update never clobbers it and never
+# conflicts with it, so it is the frictionless place for users to add their OWN
+# package fixups (the tracked sysroot-fix.yaml can conflict on update). We seed it
+# only when absent so a user's edits are never overwritten. Editing it does NOT
+# auto-apply — run `sysroot-fix` to patch the sysroot with the new rules.
+APPEND_TEMPLATE="$TOOLCHAIN_DIR/sysroot-fix-append.template.yaml"
+APPEND_FILE="$TOOLCHAIN_DIR/sysroot-fix-append.yaml"
+if [ -f "$APPEND_TEMPLATE" ] && [ ! -f "$APPEND_FILE" ]; then
+  cp "$APPEND_TEMPLATE" "$APPEND_FILE"
+  echo "[INFO] Seeded sysroot-fix-append.yaml from template."
 fi
 
 # === Symlink agent skill files ===

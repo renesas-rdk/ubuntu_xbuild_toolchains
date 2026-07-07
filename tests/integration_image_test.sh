@@ -85,7 +85,11 @@ put_file() {
 # =============================================================================
 # 1. First start of the released image
 # =============================================================================
-docker run -dt --privileged --name "$CTN" "$IMAGE" >/dev/null
+# TOOLCHAIN_API_BASE points the entrypoint's "latest release" lookup at a local
+# mock (populated in step 2), so this test controls which release is delivered
+# without touching the real GitHub API.
+docker run -dt --privileged -e TOOLCHAIN_API_BASE=file:///tmp/ghapi \
+    --name "$CTN" "$IMAGE" >/dev/null
 
 it "1.1 released image completes its first startup"
 if wait_startup 1; then _pass "$CURRENT_TEST"
@@ -97,11 +101,17 @@ TC_WS="$(docker exec "$CTN" bash -lc 'printf %s "$TOOLCHAINS_WS"')"
 # =============================================================================
 # 2. Deliver this commit through the entrypoint's own auto-update path
 # =============================================================================
+# The delivery is set up for EVERY entrypoint generation the released image
+# might still carry, since the image ships with the previously-released
+# entrypoint until this candidate becomes a release:
+#   - branch `main`  — an old `git pull --ff-only origin main` entrypoint;
+#   - tag $CAND_TAG  — an old `git tag | sort -V | tail -1` entrypoint;
+#   - mock release   — the current entrypoint, which reads the latest published
+#                      release from $TOOLCHAIN_API_BASE (the file:// mock).
 git -C "$REPO" archive --format=tar HEAD >"$TARBALL"
 ORIG_SHA="$(dexec "git -C '$TC_WS' rev-parse HEAD" | tr -d '[:space:]')"
 
-# Outranks any real vX.Y.Z so the entrypoint's latest-release pick (sort -V |
-# tail -1) selects this candidate.
+# Outranks any real vX.Y.Z for the old sort -V | tail -1 entrypoint.
 CAND_TAG="v99.99.99"
 
 it "2.1 candidate commit staged as a fast-forward of the container checkout"
@@ -133,6 +143,14 @@ if [ -z "$CAND_SHA" ] || [ "$CAND_SHA" = "$ORIG_SHA" ]; then
     _fail "$CURRENT_TEST" "no new candidate commit (HEAD=$CAND_SHA, orig=$ORIG_SHA)"; finish
 fi
 _pass "$CURRENT_TEST"
+
+# Seed the mock release the current entrypoint reads: derive the slug from origin
+# exactly as the entrypoint does, so the mock lands at the path it will curl
+# ($TOOLCHAIN_API_BASE/repos/<slug>/releases/latest).
+slug="$(dexec "git -C '$TC_WS' remote get-url origin | sed -E 's#^.*github[.]com[:/]##; s#[.]git\$##'")"
+put_file "/tmp/ghapi/repos/$slug/releases/latest" <<EOF
+{"tag_name":"$CAND_TAG"}
+EOF
 
 it "2.2 restart completes startup with the update pending"
 docker restart "$CTN" >/dev/null

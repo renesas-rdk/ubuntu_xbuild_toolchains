@@ -2,10 +2,10 @@ name: test
 
 on:
   push:
+    branches: ['**']
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
-  release:
-    types: [published]
 
 jobs:
   # Behavior tests, run as root in a clean container to match the real image:
@@ -30,12 +30,14 @@ jobs:
   # released image via the auto-update path, then drives the real execution
   # paths (entrypoint end-to-end, arm64-chroot, a real cross build).
   #
-  # Gated to maintainer-only events (release / workflow_dispatch), never
-  # pull_request, so untrusted forks can't reach this privileged job. Safe to
-  # move to a self-hosted runner for image caching — swap `runs-on` for your
-  # labels; the test script skips the pull when the image is already local.
+  # Runs on a `v*` tag push (a release candidate) or manual dispatch, never on
+  # pull_request, so untrusted forks can't reach this privileged job. The tag is
+  # only a candidate — the `release` job below publishes the actual release only
+  # if this passes, and entrypoint.sh tracks published releases, so a failing tag
+  # never reaches users. Safe to run on a self-hosted runner for image caching —
+  # the test script skips the pull when the image is already local.
   integration:
-    if: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
     runs-on: [self-hosted, linux, x64, xbuild-integ]
     timeout-minutes: 90
     permissions:
@@ -82,3 +84,25 @@ jobs:
             sysroot-rosdep-install.sh \
             tests/entrypoint_test.sh tests/scripts_behavior.sh \
             tests/integration_image_test.sh tests/lib/assert.sh
+
+  # Publish the GitHub Release — the step that actually delivers a version to
+  # users, since entrypoint.sh tracks the latest PUBLISHED release. Gated behind
+  # every test job, so a `v*` tag whose tests fail never becomes a release and
+  # never reaches a container. Push the tag; do not create releases by hand.
+  release:
+    needs: [behavior, integration, shellcheck]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            echo "Release ${{ github.ref_name }} already exists — skipping."
+          else
+            gh release create "${{ github.ref_name }}" --generate-notes --verify-tag
+          fi

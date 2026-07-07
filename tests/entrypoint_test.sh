@@ -2,19 +2,23 @@
 # -----------------------------------------------------------------------------
 # entrypoint.sh — auto-update / restart resilience tests.
 #
-# entrypoint.sh checks out the latest vX.Y.Z release tag on every container
-# start (`git fetch --tags` + `git checkout` the highest version) so a restart
-# picks up a new release without an image rebuild. The contract these tests lock
-# in is: that auto-update must NEVER wedge the container. Offline, a fetch
-# timeout, a remote with no release tag, or a failing post-update step must all
-# fall through to a warning and let startup complete with the toolchain wrappers
-# on PATH.
+# entrypoint.sh checks out the latest PUBLISHED GitHub release on every container
+# start: it reads the release tag from the Releases API, fetches that tag, and
+# checks it out, so a restart picks up a new release without an image rebuild.
+# The contract these tests lock in is: that auto-update must NEVER wedge the
+# container. Offline, an unresolvable release, a remote whose tag cannot be
+# fetched, or a failing post-update step must all fall through to a warning and
+# let startup complete with the toolchain wrappers on PATH. A second contract:
+# local edits to tracked toolchain files are NEVER silently discarded — they are
+# stashed and re-applied on top of the release, and a conflicting re-apply leaves
+# git conflict markers for the user (cases 6 & 7). Case 8 covers seeding the
+# gitignored sysroot-fix-append.yaml from its template without clobbering edits.
 #
 # The entrypoint is driven DIRECTLY (not through a built image) against a
-# throwaway toolchain checkout wired to a local bare git remote, so the
-# auto-update outcomes that need a controllable remote — a real release tag,
-# version-sort selection, offline, no-tag — are reproduced with real git and
-# asserted deterministically. The happy path on the real released image is
+# throwaway toolchain checkout wired to a local bare git remote, with the
+# Releases API mocked via TOOLCHAIN_API_BASE=file://... — so "which release is
+# latest", offline, and fetch-failure outcomes are reproduced deterministically
+# with real git and no network. The happy path on the real released image is
 # covered by tests/integration_image_test.sh.
 #
 # Runs as root inside a container (see .github/workflows/test.yml) so the
@@ -96,6 +100,18 @@ tag_remote() {
       git push -q origin "refs/tags/$tag" >/dev/null 2>&1 )
 }
 
+# set_latest_release BASE TAG — point the mocked Releases API (served from
+# file://BASE/ghapi) at TAG, written to the exact path the entrypoint derives
+# from its current origin URL. This is what makes the entrypoint pick TAG as the
+# latest published release; the tag object must already exist on the remote.
+# Call it AFTER any `remote set-url`, so the derived slug matches.
+set_latest_release() {
+    local base="$1" tag="$2" slug
+    slug="$(git -C "$base/toolchains" remote get-url origin | sed -E 's#^.*github\.com[:/]##; s#\.git$##')"
+    mkdir -p "$base/ghapi/repos/$slug/releases"
+    printf '{"tag_name":"%s"}' "$tag" > "$base/ghapi/repos/$slug/releases/latest"
+}
+
 # run_entry BASE [CMD...] — run the entrypoint from the sandbox with a hermetic
 # env, ending in CMD (default: print a startup sentinel). Captures stdout+stderr.
 run_entry() {
@@ -107,6 +123,7 @@ run_entry() {
         PATH="$SHIM_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
         ARM64_SYSROOT="$base/sysroot" \
         TOOLCHAINS_WS="$tc" \
+        TOOLCHAIN_API_BASE="file://$base/ghapi" \
         ROS2_WS="$base/no_ros2_ws" \
         PRODUCT="V2H" \
         bash "$tc/entrypoint.sh" "$@" 2>&1
@@ -118,10 +135,11 @@ run_entry() {
 # Only the git edge cases that need a controllable local remote remain.
 
 # =============================================================================
-# 1. The latest release tag is checked out on start
+# 1. The latest published release is checked out on start
 # =============================================================================
 base="$(make_sandbox)"
 tag_remote "$base" "v1.0.0" "release-one"
+set_latest_release "$base" "v1.0.0"
 before="$(git -C "$base/toolchains" rev-parse HEAD)"
 
 it "1.1 latest release tag is checked out and startup completes"
@@ -134,38 +152,43 @@ it "1.2 local HEAD actually advanced to the tagged commit"
     || _fail "$CURRENT_TEST" "HEAD did not move: still $after"
 
 # =============================================================================
-# 2. The HIGHEST version tag wins — version sort, not lexical
+# 2. The entrypoint obeys the PUBLISHED release, not the highest tag present
 # =============================================================================
 base="$(make_sandbox)"
 tag_remote "$base" "v1.9.0"  "release-1.9"
-tag_remote "$base" "v1.10.0" "release-1.10"      # lexically < v1.9.0, numerically >
+tag_remote "$base" "v1.10.0" "release-1.10"      # a higher tag also exists on the remote
+set_latest_release "$base" "v1.9.0"              # but the API publishes only v1.9.0
 
-it "2.1 v1.10.0 is preferred over v1.9.0 (sort -V)"
+it "2.1 checks out the published v1.9.0 even though a higher v1.10.0 tag exists"
 out="$(run_entry "$base")"
-assert_contains "$out" "checked out release v1.10.0"
+assert_contains "$out" "checked out release v1.9.0"
+assert_not_contains "$out" "v1.10.0"
 assert_contains "$out" "--- Startup Complete ---"
 
 # =============================================================================
-# 3. Offline / unreachable remote must NOT wedge the container
+# 3. A release is published but its tag cannot be fetched -> graceful skip
 # =============================================================================
 base="$(make_sandbox)"
-git -C "$base/toolchains" remote set-url origin https://127.0.0.1:1/nope.git
+# Point origin at a missing repo FIRST, then key the mock to that same origin, so
+# the release resolves but the tag fetch is what fails.
+git -C "$base/toolchains" remote set-url origin "$base/gone.git"
+set_latest_release "$base" "v1.0.0"
 
-it "3.1 unreachable remote -> auto-update skipped, container still starts"
+it "3.1 unfetchable release tag -> auto-update skipped, container still starts"
 out="$(run_entry "$base" /bin/echo STILL_ALIVE)"
-assert_contains "$out" "Auto-update skipped"
+assert_contains "$out" "Could not fetch release v1.0.0"
 assert_contains "$out" "--- Startup Complete ---"
 assert_contains "$out" "STILL_ALIVE"
 
 # =============================================================================
-# 4. A remote with no release tag falls back to the local toolchain
+# 4. No published release (API resolves nothing) falls back to local toolchain
 # =============================================================================
-base="$(make_sandbox)"                           # make_sandbox pushes no tags
+base="$(make_sandbox)"                           # no release mocked for this sandbox
 before="$(git -C "$base/toolchains" rev-parse HEAD)"
 
-it "4.1 no release tag -> fetch ok but nothing checked out, container starts"
+it "4.1 no published release -> nothing checked out, container starts"
 out="$(run_entry "$base" /bin/echo NO_TAG_OK)"
-assert_contains "$out" "No release tag found"
+assert_contains "$out" "No published release resolved"
 assert_contains "$out" "--- Startup Complete ---"
 assert_contains "$out" "NO_TAG_OK"
 after="$(git -C "$base/toolchains" rev-parse HEAD)"
@@ -188,11 +211,94 @@ git clone -q --branch main "$base/remote.git" "$work/c"
   git tag v1.0.0
   git push -q origin HEAD:main >/dev/null 2>&1
   git push -q origin refs/tags/v1.0.0 >/dev/null 2>&1 )
+set_latest_release "$base" "v1.0.0"
 
 it "5.1 failing sysroot-fix is warned about but does not abort startup"
 out="$(run_entry "$base" /bin/echo SURVIVED)"
 assert_contains "$out" "sysroot-fix failed"
 assert_contains "$out" "--- Startup Complete ---"
 assert_contains "$out" "SURVIVED"
+
+# =============================================================================
+# 6. A NON-conflicting local edit is preserved across the update
+# =============================================================================
+base="$(make_sandbox)"
+tag_remote "$base" "v1.0.0" "release-one"        # release only touches RELEASE_CHANGE
+set_latest_release "$base" "v1.0.0"
+# User edits a different tracked file locally, uncommitted.
+printf '\n# user local tweak\n' >>"$base/toolchains/arm64-chroot.sh"
+
+it "6.1 non-conflicting local edit -> re-applied cleanly, startup completes"
+out="$(run_entry "$base")"
+assert_contains "$out" "re-applied cleanly"
+assert_contains "$out" "--- Startup Complete ---"
+
+it "6.2 HEAD advanced to the release tag"
+[ "$(git -C "$base/toolchains" rev-parse HEAD)" = "$(git -C "$base/toolchains" rev-parse v1.0.0)" ] \
+    && _pass "$CURRENT_TEST" || _fail "$CURRENT_TEST" "HEAD is not at v1.0.0"
+
+it "6.3 the user's local edit survived the update"
+grep -q "user local tweak" "$base/toolchains/arm64-chroot.sh" \
+    && _pass "$CURRENT_TEST" || _fail "$CURRENT_TEST" "edit was discarded"
+
+# =============================================================================
+# 7. A CONFLICTING local edit is NOT discarded — conflict markers are left
+# =============================================================================
+base="$(make_sandbox)"
+tc="$base/toolchains"
+# Share a tracked file on main so both the release and the user can diverge it.
+printf 'line-base\n' >"$tc/SHARED.txt"
+( cd "$tc" || exit 1
+  git add SHARED.txt >/dev/null
+  git "${GIT_ID[@]}" commit -qm add-shared
+  git push -q origin main >/dev/null 2>&1 )
+# Cut a release that changes SHARED.txt.
+work="$(mktemp -d)"; SANDBOXES+=("$work")
+git clone -q --branch main "$base/remote.git" "$work/c"
+( cd "$work/c" || exit 1
+  printf 'line-from-release\n' >SHARED.txt
+  git add -A >/dev/null
+  git "${GIT_ID[@]}" commit -qm release-change-shared
+  git tag v1.0.0
+  git push -q origin HEAD:main >/dev/null 2>&1
+  git push -q origin refs/tags/v1.0.0 >/dev/null 2>&1 )
+set_latest_release "$base" "v1.0.0"
+# User edits the same file, conflictingly, uncommitted.
+printf 'line-from-user\n' >"$tc/SHARED.txt"
+
+it "7.1 conflicting edit -> warned as a CONFLICT, never wedges startup"
+out="$(run_entry "$base")"
+assert_contains "$out" "CONFLICT with release v1.0.0"
+assert_contains "$out" "git stash drop"
+assert_contains "$out" "--- Startup Complete ---"
+
+it "7.2 conflict markers are left in the affected file for the user to resolve"
+grep -q '^<<<<<<<' "$tc/SHARED.txt" \
+    && _pass "$CURRENT_TEST" || _fail "$CURRENT_TEST" "no conflict markers in SHARED.txt"
+
+it "7.3 the stashed edit is retained as a safety copy"
+git -C "$tc" rev-parse -q --verify refs/stash >/dev/null 2>&1 \
+    && _pass "$CURRENT_TEST" || _fail "$CURRENT_TEST" "stash was not kept"
+
+# =============================================================================
+# 8. sysroot-fix-append.yaml is seeded from its template, and a user-edited
+#    one is never overwritten on restart.
+# =============================================================================
+base="$(make_sandbox)"
+tc="$base/toolchains"
+cp "$REPO/sysroot-fix-append.template.yaml" "$tc/"      # ship the template in the checkout
+
+it "8.1 first start seeds sysroot-fix-append.yaml from the template"
+out="$(run_entry "$base")"
+assert_contains "$out" "Seeded sysroot-fix-append.yaml from template"
+[ -f "$tc/sysroot-fix-append.yaml" ] && _pass "$CURRENT_TEST" \
+    || _fail "$CURRENT_TEST" "append file was not created"
+
+it "8.2 a user-edited append file is NOT overwritten on the next start"
+printf 'my_pkg:\n  - {file: x, find: a, replace: b}\n' >"$tc/sysroot-fix-append.yaml"
+out="$(run_entry "$base")"
+assert_not_contains "$out" "Seeded sysroot-fix-append.yaml from template"
+grep -q "my_pkg" "$tc/sysroot-fix-append.yaml" \
+    && _pass "$CURRENT_TEST" || _fail "$CURRENT_TEST" "user edit was overwritten"
 
 finish
