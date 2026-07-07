@@ -38,6 +38,13 @@ if [ ! -w /usr/local/bin ]; then
     exit 0
 fi
 
+# The entrypoint resolves releases with curl; without it every auto-update case
+# would silently see "no release" and fail confusingly.
+if ! command -v curl >/dev/null 2>&1; then
+    echo "SKIP: curl not found — install it (e.g. apt-get install curl) to run these tests." >&2
+    exit 0
+fi
+
 # --- sudo shim: run the command directly (we are already root) ----------------
 SHIM_DIR="$(mktemp -d)"
 cat >"$SHIM_DIR/sudo" <<'SHIM'
