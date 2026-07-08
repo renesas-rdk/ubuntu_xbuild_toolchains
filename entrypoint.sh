@@ -158,12 +158,9 @@ VSCODE_DIR="$TOOLCHAIN_DIR/.vscode"
 TEMPLATE="$VSCODE_DIR/settings.template.json"
 SETTINGS="$VSCODE_DIR/settings.json"
 if [ -f "$TEMPLATE" ]; then
-  if [ ! -f "$SETTINGS" ]; then
-    cp "$TEMPLATE" "$SETTINGS"
-    echo "[INFO] Seeded .vscode/settings.json from template."
-  elif command -v python3 >/dev/null 2>&1; then
+  if command -v python3 >/dev/null 2>&1; then
     if python3 - "$TEMPLATE" "$SETTINGS" <<'PYMERGE'; then
-import json, re, sys
+import json, os, re, sys
 
 USER_KEYS = ["TARGET_IP", "TARGET_GDB_PORT", "TARGET_USER", "TARGET_PASSWORD",
              "TARGET_ROS2_WS", "NODE_PACKAGE_NAME", "NODE_EXECUTABLE_NAME",
@@ -178,21 +175,39 @@ def load_jsonc(path):
     return json.loads(text)
 
 template, settings = sys.argv[1], sys.argv[2]
-merged = load_jsonc(template)
-user = load_jsonc(settings)
-for k in USER_KEYS:
-    if k in user:
-        merged[k] = user[k]
+
+# Pull over values the user already set, so a re-run never clobbers them.
+overrides = {}
+if os.path.exists(settings):
+    user = load_jsonc(settings)
+    overrides = {k: user[k] for k in USER_KEYS if k in user}
+
+# Transform the template TEXT (not its parsed data) so blank-line grouping,
+# key order, and any comments survive verbatim. We only ever: drop the
+# template-only "DO NOT EDIT" banner, and swap in the user's override values.
+key_re = re.compile(r'^(\s*"([^"]+)"\s*:\s*)("(?:[^"\\]|\\.)*"|[^,]*?)(,?\s*)$')
+out = []
+with open(template, encoding="utf-8") as f:
+    for line in f:
+        if line.lstrip().startswith('"#"'):
+            continue
+        m = key_re.match(line.rstrip("\n"))
+        if m and m.group(2) in overrides:
+            line = m.group(1) + json.dumps(overrides[m.group(2)], ensure_ascii=False) + m.group(4) + "\n"
+        out.append(line)
+
 with open(settings + ".tmp", "w", encoding="utf-8") as f:
-    json.dump(merged, f, indent=4, ensure_ascii=False)
-    f.write("\n")
+    f.writelines(out)
 PYMERGE
       mv "$SETTINGS.tmp" "$SETTINGS"
-      echo "[INFO] Merged template into .vscode/settings.json (user values preserved)."
+      echo "[INFO] Seeded/merged .vscode/settings.json from template (user values preserved)."
     else
       rm -f "$SETTINGS.tmp"
       echo "[WARN] settings.json merge skipped (invalid JSON?) — kept user file as-is."
     fi
+  elif [ ! -f "$SETTINGS" ]; then
+    cp "$TEMPLATE" "$SETTINGS"
+    echo "[INFO] Seeded .vscode/settings.json from template (python3 unavailable; banner not stripped)."
   else
     echo "[WARN] python3 not found — skipping settings.json template merge."
   fi
