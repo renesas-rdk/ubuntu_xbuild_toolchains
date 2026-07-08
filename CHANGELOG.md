@@ -2,6 +2,20 @@
 
 ## [1.2.0] - 2026-07-11
 
+### Upgrade notice
+
+> **Before running this release, remove the old toolchain files from your mount workspace.**
+>
+> This release wires the toolchain's skill files (`.vscode/`, `.github/`, `.claude/`, `AGENTS.md`, `.clang-format`) into the workspace as **symlinks** to the decoupled toolchain directory. To avoid destroying anything you own, the entrypoint now **refuses to overwrite a real file or directory already sitting at those paths** - it keeps it and prints a `[WARN]`. Anyone upgrading from the older in-place layout still has real copies of those files in the workspace, so the new symlinks are skipped and the toolchain integration (VS Code tasks, agent skills) never activates.
+>
+> From your workspace root, delete the stale copies so the entrypoint can recreate them as symlinks on the next container start:
+>
+> ```sh
+> rm -rf .vscode .github .claude AGENTS.md .clang-format
+> ```
+>
+> If you customized `.vscode/settings.json` (e.g. `TARGET_IP`, `TARGET_PASSWORD`), **back up those values first** - after removal, `settings.json` is re-seeded from the template and you re-enter them. Stale *symlinks* left by a prior pre-release are refreshed automatically and need no action.
+
 ### Added
 
 - Multi-arch Docker image builds for `amd64` and `arm64` (Apple M1/M2 hosts).
