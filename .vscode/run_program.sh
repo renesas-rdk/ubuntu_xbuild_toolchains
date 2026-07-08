@@ -75,7 +75,10 @@ fi
 
 # Check if install folder exists relative to the script location and copy it to remote /tmp if it does
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALL_DIR="${SCRIPT_DIR}/../install"
+# Strip the trailing "/.vscode" by string, not via kernel "..", so a symlinked
+# .vscode (e.g. ~/ros2_ws/.vscode -> ~/toolchains/.vscode) still resolves
+# install/ next to the *logical* workspace instead of the symlink's real parent.
+INSTALL_DIR="${SCRIPT_DIR%/*}/install"
 
 if [ -d "$INSTALL_DIR" ]; then
   echo -e "${GREEN}[Host] '$INSTALL_DIR' folder found. Synchronizing install folder${NONE}"
