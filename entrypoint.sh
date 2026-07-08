@@ -227,12 +227,25 @@ if [ -f "$APPEND_TEMPLATE" ] && [ ! -f "$APPEND_FILE" ]; then
 fi
 
 # === Symlink agent skill files ===
+# Guarded so a mounted workspace that already ships its own .vscode/.github/
+# AGENTS.md/etc. is never clobbered: refresh our own symlink, but if a real
+# file/dir is already there, leave it and warn. Plain `ln -sfn` would either
+# delete the user's file (file dest) or nest a bogus .vscode/.vscode inside it
+# (directory dest) — both silently.
+link_skill() {  # $1=toolchain target, $2=link path in the workspace
+  if [ -L "$2" ] || [ ! -e "$2" ]; then
+    ln -sfn "$1" "$2"
+  else
+    echo "[WARN] $2 already exists and is not a symlink — keeping it, not linking $(basename "$1") from the toolchain."
+  fi
+}
+
 if [ -d "$ROS2_WS_DIR" ] && [ "$ROS2_WS_DIR" != "$TOOLCHAIN_DIR" ]; then
-  ln -sfn "$TOOLCHAIN_DIR/.vscode"       "$ROS2_WS_DIR/.vscode"
-  ln -sfn "$TOOLCHAIN_DIR/.github"       "$ROS2_WS_DIR/.github"
-  ln -sfn "$TOOLCHAIN_DIR/.claude"       "$ROS2_WS_DIR/.claude"
-  ln -sfn "$TOOLCHAIN_DIR/AGENTS.md"     "$ROS2_WS_DIR/AGENTS.md"
-  ln -sfn "$TOOLCHAIN_DIR/.clang-format" "$ROS2_WS_DIR/.clang-format"
+  link_skill "$TOOLCHAIN_DIR/.vscode"       "$ROS2_WS_DIR/.vscode"
+  link_skill "$TOOLCHAIN_DIR/.github"       "$ROS2_WS_DIR/.github"
+  link_skill "$TOOLCHAIN_DIR/.claude"       "$ROS2_WS_DIR/.claude"
+  link_skill "$TOOLCHAIN_DIR/AGENTS.md"     "$ROS2_WS_DIR/AGENTS.md"
+  link_skill "$TOOLCHAIN_DIR/.clang-format" "$ROS2_WS_DIR/.clang-format"
   echo "[INFO] Agent skill files symlinked to $ROS2_WS_DIR."
 fi
 
