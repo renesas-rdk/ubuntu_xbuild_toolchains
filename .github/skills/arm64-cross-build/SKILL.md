@@ -1,6 +1,6 @@
 ---
 name: arm64-cross-build
-description: Use this skill when an AI agent needs to build, clean, or install dependencies in this ARM64 ROS 2 Jazzy cross-compilation workspace. Triggers include "build the workspace", "rebuild package X", "install rosdep deps", "clean build", "fix the cross compile", or any colcon-related task in this repo.
+description: Use this skill when an AI agent needs to build, clean, or install dependencies in this ARM64 ROS 2 Jazzy cross-compilation workspace, or to diagnose a build failure in it. Triggers include "build the workspace", "rebuild package X", "install rosdep deps", "clean build", "fix the cross compile", "CMake can't find package X", "rebuild still fails after rosdep install", "urdfdom not found", "sysroot path is wrong", or any colcon-related task in this repo.
 ---
 
 # ARM64 Cross Build
@@ -85,8 +85,11 @@ Rules:
 ## Build-failure decision tree
 
 1. `cross-colcon-build: command not found` → not in dev container.
-2. `find_package(...) ... not found` → run `sysroot-rosdep-install`,
-   then re-build.
+2. `find_package(...) ... not found` → run the discriminator:
+   `find "$ARM64_SYSROOT" -name "<pkg>*onfig.cmake"`.
+   - Config **exists** in the sysroot but `find_package` still misses it
+     → read `references/configure-errors.md` before changing anything.
+   - Config **does not exist** → `sysroot-rosdep-install`, then rebuild.
 3. Linker error referencing a symbol that exists on host → a host
    library leaked in. Re-check `CMakeLists.txt` for absolute `/usr/...`
    paths or non-`ament_*` `find_package` calls.
@@ -215,6 +218,8 @@ paraphrasing:
 
 ## Cross-references
 
+- CMake configure errors this tree doesn't resolve →
+  `references/configure-errors.md`.
 - Package layout, naming, formatting → `arm64-ros2-package-conventions`.
 - Pushing the resulting `install/` to the board → `arm64-deploy-debug`.
 - Verifying behavior on the board after a build → `arm64-target-autonomous-test`.
