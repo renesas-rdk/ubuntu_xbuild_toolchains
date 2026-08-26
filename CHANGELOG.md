@@ -1,5 +1,17 @@
 # Change Log
 
+## [1.3.0] - 2026-08-26
+
+### Added
+
+- `.agents/skills` symlink to `.github/skills/` so Codex CLI detects all skills; the entrypoint now links `.agents` into the workspace too.
+- Two `arm64-cross-build` references: `configure-errors.md` (stale `-NOTFOUND` cache, missing sysroot dependency, non-relocatable CMake export paths) and `strict-flag-errors.md` (`-Werror` / `-Wconversion` / `-pedantic-errors` failures).
+
+### Changed
+
+- The `arm64-cross-build` skill now covers the per-board `<product>_cross.cmake` variants, whose warning strictness differs - the same source can build for one board and fail on another. On a strict-flag failure the agent asks the user before fixing the code or relaxing `CMakeLists.txt`.
+- `check_package_versions.py` now compares the full Debian dependency closure of each side, requires every direct dependency on both sides, and syncs to the newest version available to both instead of upgrading each side to its own latest.
+
 ## [1.2.0] - 2026-07-11
 
 ### Upgrade notice
