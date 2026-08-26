@@ -5,13 +5,16 @@ Triage table for **CMake configure-time** failures in this workspace.
 Reference for `arm64-cross-build`; read it when the build-failure
 decision tree sends you here.
 
+Issue 3 is the exception to "configure-time": the same root cause can
+surface at link time instead. See its Recognition notes.
+
 ## Triage: pick the issue by its signature
 
 | Error signature | Issue | Section |
 |---|---|---|
 | `Could not find a package configuration file provided by "X"` **and** the config file *does* exist in `$ARM64_SYSROOT` | Stale `X_DIR-NOTFOUND` in `CMakeCache.txt` | Issue 1 |
 | `Could not find a package configuration file provided by "X"` **and** nothing matching exists in `$ARM64_SYSROOT` | Dependency genuinely missing from the sysroot | Issue 2 |
-| `The imported target "..." references a file but this file does not exist` / error path contains a bare `/opt/ros/jazzy/...` or `/usr/lib/...` (no `$ARM64_SYSROOT` prefix) | Non-relocatable hardcoded path in a sysroot CMake export | Issue 3 |
+| `The imported target "..." references a file but this file does not exist` / `Imported target "..." includes non-existent path` / a link error naming a path with a bare `/opt/ros/jazzy/...`, `/usr/lib/...`, or `/usr/include/...` (no `$ARM64_SYSROOT` prefix) | Non-relocatable hardcoded path in a sysroot CMake export | Issue 3 |
 
 **Always run the discriminator first** — it decides between Issue 1 and
 Issue 2, which have opposite fixes:
@@ -113,12 +116,28 @@ the caches it reports.
 ### Why it happens
 
 The sysroot is a relocated copy of the board rootfs, so CMake export
-files that hardcode `/opt/ros/jazzy` or `/usr/lib/aarch64-linux-gnu/...`
-point outside `$ARM64_SYSROOT` and resolve to host paths or nothing.
+files that hardcode `/opt/ros/jazzy`, `/usr/lib/aarch64-linux-gnu/...`,
+or `/usr/include/...` point outside `$ARM64_SYSROOT` and resolve to host
+paths or nothing.
 
 Recognition: the error names a file under `$ARM64_SYSROOT/.../cmake/...`
 but the *missing* path it complains about has **no** `$ARM64_SYSROOT`
 prefix.
+
+Which failure you get depends on the property holding the bad path:
+
+- `INTERFACE_INCLUDE_DIRECTORIES` — CMake validates these at generate
+  time, so it surfaces as a **configure** error
+  (`includes non-existent path`).
+- `INTERFACE_LINK_LIBRARIES` only — nothing is checked at configure
+  time, so the bad path reaches the linker and surfaces as a **link**
+  error. That looks like `SKILL.md` decision-tree item 4 (host library
+  leaked in); check the sysroot export file before editing
+  `CMakeLists.txt`.
+- **Latent.** If nothing in the workspace links the broken imported
+  target, the build passes and the bug stays invisible until some
+  package does link it. A green build is not proof the exports are
+  sound — only a scan is.
 
 ### Fix
 
@@ -130,8 +149,9 @@ Add new rules to **`sysroot-fix-append.yaml`** — `sysroot-fix.yaml` is
 tracked with the toolchain and is overwritten by container updates.
 
 ```bash
-# 1. Locate the hardcoded path.
-grep -RIn "/opt/ros/${ROS_DISTRO}" \
+# 1. Locate the hardcoded path. Match any quoted absolute path — grepping
+#    only for /opt/ros/${ROS_DISTRO} misses /usr/include and /usr/lib cases.
+grep -RIn -E '"/(opt|usr)/' \
   "$ARM64_SYSROOT/opt/ros/${ROS_DISTRO}/lib/aarch64-linux-gnu/cmake/<pkg>"
 
 # 2. Append a rule to /home/ubuntu/toolchains/sysroot-fix-append.yaml:
@@ -147,13 +167,61 @@ sysroot-fix
 
 # 4. Rebuild.
 cross-colcon-build --packages-up-to <pkg>
-```
+```q
 
 Replacement is normally `${_IMPORT_PREFIX}`; use
 `${_IMPORT_PREFIX}/../../..` when the file sits deeper than the prefix
-root. `sysroot-fix --list` shows which packages already have rules.
+root — `_IMPORT_PREFIX` is the export file's directory walked up by the
+`get_filename_component` calls at the top of the file, so check how many
+levels it actually climbs before assuming. `sysroot-fix --list` shows
+which packages already have rules.
+
+### Make the rule idempotent
+
+`sysroot-fix` applies each rule as a plain string replace with **no
+already-patched guard**. If `replace` still contains `find`, every run
+re-patches and corrupts the file:
+
+```
+run 1:  "${_IMPORT_PREFIX}/../../../usr/include/libusb-1.0"
+run 2:  "${_IMPORT_PREFIX}/../../..${_IMPORT_PREFIX}/../../../usr/include/libusb-1.0"
+```
+
+Include the surrounding quotes in both `find` and `replace` to anchor the
+match. Once patched, the value no longer starts with `"/usr/...`, so a
+second run reports `matched_rules=0` and changes nothing:
+
+```yaml
+find: '"/usr/include/libusb-1.0"'
+replace: '"${_IMPORT_PREFIX}/../../../usr/include/libusb-1.0"'
+```
+
+Verify by running `sysroot-fix <pkg>` twice — the second run must report
+`matched_rules=0`. The shipped `pinocchio` and `flann` rules are safe
+only because their replacements happen to drop the matched segment, not
+because the tool protects you.
 
 Upstream examples: `pinocchio`, `hardware_interface`, `flann`.
+Covered locally in `sysroot-fix-append.yaml`, pending upstreaming:
+`realsense2` (`realsense2::usb` hardcodes both libusb paths).
+
+### Report it upstream
+
+A working rule is worth upstreaming. `sysroot-fix-append.yaml` is
+gitignored, so a local-only rule is lost on the next container update
+and every other developer rediscovers the same failure.
+
+Recommend this **only** when the broken package ships with the RDK image
+(e.g. `pinocchio`, `hardware_interface`, `flann`). Rules for a private or
+vendor package stay in `sysroot-fix-append.yaml`.
+
+Repo: <https://github.com/renesas-rdk/ubuntu_xbuild_toolchains>
+Include: package name, the `CMake Error` block, the offending export file
+path, and the `sysroot-fix-append.yaml` rule that fixed it.
+
+**Draft the report and hand it to the user — do not file it.** Filing is
+theirs to approve, and the error text often carries private package names
+and paths.
 
 ---
 
