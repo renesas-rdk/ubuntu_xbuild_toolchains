@@ -14,11 +14,18 @@
 #
 #   "Community" packages are every dependency declared in src/*/package.xml
 #   (third-party deps installed as debs), EXCLUDING the workspace's own packages
-#   (which are built from source). Only packages that appear in a package.xml AND
-#   are installed on BOTH sides with DIFFERING versions are treated as a
-#   "version mismatch". On confirmation, BOTH the sysroot AND the board are
-#   upgraded to the LATEST available version of every mismatched package, so the
-#   two converge at the newest release (not merely at whichever side was ahead).
+#   (which are built from source). The check expands those direct dependencies
+#   through each environment's installed Debian Depends/Pre-Depends graph. This
+#   catches ABI providers that are only transitive dependencies.
+#
+#   Every direct dependency must be installed on both sides, and every package
+#   present in both transitive closures must have the exact same Debian version.
+#   A transitive package used only by one environment is reported as not
+#   comparable; it is often a legitimate alternative/runtime-only dependency.
+#   On confirmation, the script refreshes APT metadata, selects the newest exact
+#   version available to BOTH environments, and installs that exact
+#   package=version on each side. It never independently upgrades each side to a
+#   moving "latest" candidate.
 #
 # Usage:
 #   check_package_versions.py IP USER PASSWORD SYSROOT [SRC_DIR] [--check-only] [--yes]
@@ -34,8 +41,10 @@
 # -----------------------------------------------------------------------------
 
 import argparse
+from functools import cmp_to_key
 import glob
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -152,39 +161,53 @@ def enumerate_community(src_dir):
 
 
 # -----------------------------------------------------------------------------
-# 2. Read installed versions from the sysroot and the board
+# 2. Read installed package metadata from the sysroot and the board
 # -----------------------------------------------------------------------------
-def _parse_dump(text):
-    """Parse `dpkg-query -W -f='${Package}\\t${Version}\\n'` output into a dict.
+DPKG_QUERY_FORMAT = (
+    r"${db:Status-Abbrev}\t${Package}\t${Version}\t${Depends}\t"
+    r"${Pre-Depends}\t${Provides}\n"
+)
 
-    Tolerates extra non-package lines (e.g. arm64-chroot banner output) by only
-    accepting lines of the exact form `name<TAB>version`.
+
+def _parse_dump(text):
+    """Parse the tab-separated package records emitted by ``dpkg-query``.
+
+    The chroot wrapper writes banner/cleanup messages to stdout, so only lines
+    with all six fields are accepted. Debian dependency fields do not contain
+    tabs.
     """
-    versions = {}
+    packages = {}
     for line in text.splitlines():
-        if "\t" not in line:
+        fields = line.split("\t")
+        if len(fields) != 6:
             continue
-        name, _, ver = line.partition("\t")
-        name, ver = name.strip(), ver.strip()
-        if name and ver and " " not in name:
-            versions[name] = ver
-    return versions
+        status, name, version, depends, pre_depends, provides = (
+            field.strip() for field in fields
+        )
+        if status == "ii" and name and version and " " not in name:
+            packages[name] = {
+                "version": version,
+                "depends": depends,
+                "pre_depends": pre_depends,
+                "provides": provides,
+            }
+    return packages
 
 
 def sysroot_dump(sysroot):
     """Query all installed packages inside the sysroot via a single chroot call."""
     env = dict(os.environ, ARM64_SYSROOT=sysroot)
-    snippet = r"dpkg-query -W -f='${Package}\t${Version}\n'"
+    snippet = f"dpkg-query -W -f={shlex.quote(DPKG_QUERY_FORMAT)}"
     res = subprocess.run(
         ["arm64-chroot", "bash", "-c", snippet],
         capture_output=True, text=True, env=env,
     )
-    versions = _parse_dump(res.stdout)
-    if not versions:
+    packages = _parse_dump(res.stdout)
+    if not packages:
         die("Could not read any package versions from the sysroot via "
             f"arm64-chroot.\n{res.stderr.strip()}")
-    info(f"Sysroot: {len(versions)} installed package(s).")
-    return versions
+    info(f"Sysroot: {len(packages)} installed package(s).")
+    return packages
 
 
 def _ssh(ip, user, password, remote, retries=SSH_RETRIES):
@@ -212,14 +235,14 @@ def board_probe(ip, user, password):
 
 def board_dump(ip, user, password):
     """Query all installed packages on the board over SSH (read-only)."""
-    snippet = r"dpkg-query -W -f='${Package}\t${Version}\n'"
+    snippet = f"dpkg-query -W -f={shlex.quote(DPKG_QUERY_FORMAT)}"
     res = _ssh(ip, user, password, snippet)
-    versions = _parse_dump(res.stdout if res else "")
-    if not versions:
+    packages = _parse_dump(res.stdout if res else "")
+    if not packages:
         die("Could not read any package versions from the board.\n"
             f"{res.stderr.strip() if res else ''}")
-    info(f"Board {ip}: {len(versions)} installed package(s).")
-    return versions
+    info(f"Board {ip}: {len(packages)} installed package(s).")
+    return packages
 
 
 # -----------------------------------------------------------------------------
@@ -260,6 +283,7 @@ def rosdep_resolve(keys, sysroot):
         f'for k in {key_list}; do '
         f'echo "ROSDEP_KEY=$k"; '
         f'rosdep resolve "$k" 2>/dev/null || true; '
+        f'echo "ROSDEP_END=$k"; '
         f'done'
     )
     res = subprocess.run(
@@ -272,6 +296,8 @@ def rosdep_resolve(keys, sysroot):
         if line.startswith("ROSDEP_KEY="):
             current = line[len("ROSDEP_KEY="):]
             mapping[current] = []
+        elif line.startswith("ROSDEP_END="):
+            current = None
         elif current and line and not line.startswith("#"):
             mapping[current].extend(line.split())
     return {k: v for k, v in mapping.items() if v}
@@ -291,54 +317,137 @@ def deb_compare(a, b):
     return 1
 
 
-def compare(community, sysroot_v, board_v):
-    """Map each community key to an installed apt name.
+def resolve_dependencies(community, sysroot_packages, board_packages, sysroot):
+    """Resolve package.xml dependency keys to Debian package names.
 
-    Returns (resolved, stragglers): `resolved` is {key: apt_name} for keys whose
-    apt package is installed on at least one side; `stragglers` are keys with no
-    installed apt match (not installed anywhere -> cannot be version-mismatched).
+    Cheap conventional-name resolution is attempted first. Unresolved keys are
+    then sent through rosdep automatically; otherwise a checker intended to be
+    an ABI gate can silently omit system keys such as ``pcl`` or ``yaml-cpp``.
+    One rosdep key may resolve to more than one Debian package.
     """
-    known = set(sysroot_v) | set(board_v)
-
-    # Resolve names; collect stragglers for the optional rosdep fallback.
-    resolved, stragglers = {}, []
+    known = set(sysroot_packages) | set(board_packages)
+    resolved = {}
+    fallback = []
     for key in sorted(community):
         apt = resolve_key(key, known)
         if apt is None:
-            stragglers.append(key)
+            fallback.append(key)
         else:
-            resolved[key] = apt
-    return resolved, stragglers
+            resolved[key] = {apt}
+
+    if fallback:
+        info(f"Resolving {len(fallback)} unmapped dependency key(s) via rosdep "
+             "(slow under QEMU)...")
+        rosdep_mapping = rosdep_resolve(fallback, sysroot)
+        unresolved = []
+        for key in fallback:
+            apt_names = set(rosdep_mapping.get(key, []))
+            if apt_names:
+                resolved[key] = apt_names
+            else:
+                unresolved.append(key)
+    else:
+        unresolved = []
+
+    return resolved, unresolved
 
 
-def build_report(resolved, sysroot_v, board_v):
+_DEPENDENCY_DECORATION = re.compile(r"\s*(?:\([^)]*\)|\[[^]]*\]|<[^>]*>)")
+
+
+def _dependency_name(value):
+    """Return the Debian package name from one dependency/provides term."""
+    value = _DEPENDENCY_DECORATION.sub("", value).strip()
+    if not value:
+        return ""
+    name = value.split()[0]
+    if ":" in name:
+        base, qualifier = name.rsplit(":", 1)
+        if qualifier in ("any", "native") or re.fullmatch(
+                r"(?:arm64|amd64|armhf|i386|ppc64el|s390x)", qualifier):
+            name = base
+    return name
+
+
+def _provider_index(packages):
+    providers = {}
+    for package, record in packages.items():
+        for term in record["provides"].split(","):
+            virtual = _dependency_name(term)
+            if virtual:
+                providers.setdefault(virtual, set()).add(package)
+    return providers
+
+
+def dependency_closure(seeds, packages):
+    """Expand seeds through installed Depends and Pre-Depends relationships."""
+    providers = _provider_index(packages)
+    closure = set()
+    pending = [name for name in seeds if name in packages]
+
+    while pending:
+        package = pending.pop()
+        if package in closure:
+            continue
+        closure.add(package)
+        record = packages[package]
+        dependency_text = ",".join(
+            part for part in (record["pre_depends"], record["depends"]) if part
+        )
+        for group in dependency_text.split(","):
+            selected = set()
+            for alternative in group.split("|"):
+                name = _dependency_name(alternative)
+                if not name:
+                    continue
+                if name in packages:
+                    selected.add(name)
+                selected.update(providers.get(name, ()))
+            pending.extend(selected - closure)
+
+    return closure
+
+
+def build_report(scope, required_both, sysroot_packages, board_packages):
+    """Compare versions in ``scope`` and enforce direct dependencies.
+
+    ``required_both`` contains direct package.xml dependency seeds. A one-sided
+    transitive package is not automatically an ABI problem because Debian
+    alternatives and environment-specific runtime helpers are valid.
+    """
     matched, mismatches, missing, absent = [], [], [], []
-    for key, apt in sorted(resolved.items()):
-        sv, bv = sysroot_v.get(apt), board_v.get(apt)
+    for apt in sorted(scope):
+        sysroot_record = sysroot_packages.get(apt)
+        board_record = board_packages.get(apt)
+        sv = sysroot_record["version"] if sysroot_record else None
+        bv = board_record["version"] if board_record else None
         if sv and bv:
             cmp = deb_compare(sv, bv)
             if cmp == 0:
-                matched.append((key, apt, sv))
+                matched.append((apt, sv))
             else:
-                outdated = "sysroot" if cmp < 0 else "board"
-                target = bv if cmp < 0 else sv
                 mismatches.append({
-                    "key": key, "apt": apt, "sysroot": sv, "board": bv,
-                    "outdated": outdated, "target": target,
+                    "apt": apt,
+                    "sysroot": sv,
+                    "board": bv,
+                    "outdated": "sysroot" if cmp < 0 else "board",
                 })
-        elif sv and not bv:
-            missing.append((key, apt, "board", sv))
-        elif bv and not sv:
-            missing.append((key, apt, "sysroot", bv))
+        elif (sv or bv) and apt in required_both:
+            missing.append({
+                "apt": apt,
+                "sysroot": sv,
+                "board": bv,
+                "missing_from": "board" if sv else "sysroot",
+            })
         else:
-            absent.append((key, apt))
+            absent.append(apt)
     return matched, mismatches, missing, absent
 
 
 # -----------------------------------------------------------------------------
 # 5. Reporting
 # -----------------------------------------------------------------------------
-def print_report(matched, mismatches, missing, absent, stragglers):
+def print_report(matched, mismatches, missing, absent, unresolved):
     step("Version comparison")
 
     if mismatches:
@@ -357,19 +466,37 @@ def print_report(matched, mismatches, missing, absent, stragglers):
             print(f"    {m['apt']:<{name_w}}  {m['sysroot']:<{sv_w}}  "
                   f"{m['board']:<{bv_w}}  {_c('1;33', verdict)}")
         print()
-    else:
+    elif not missing:
         ok("No version mismatches between the sysroot and the board.")
 
-    # The "one side only" and "not comparable" buckets are expected and noisy,
-    # so they are intentionally not listed in detail — only their counts appear
-    # in the summary below.
-    not_comparable = [a[0] for a in absent] + list(stragglers)
+    if missing:
+        name_w = max([len(m["apt"]) for m in missing] + [len("PACKAGE")])
+        sv_w = max([len(m["sysroot"] or "-") for m in missing] + [len("SYSROOT")])
+        bv_w = max([len(m["board"] or "-") for m in missing] + [len("BOARD")])
+        warn(f"{len(missing)} required package(s) are installed on one side only:")
+        print()
+        print("    " + _c("1", f"{'PACKAGE':<{name_w}}  {'SYSROOT':<{sv_w}}  "
+                                f"{'BOARD':<{bv_w}}  VERDICT"))
+        for item in missing:
+            sv = item["sysroot"] or "-"
+            bv = item["board"] or "-"
+            verdict = f"MISSING FROM {item['missing_from'].upper()}"
+            print(f"    {item['apt']:<{name_w}}  {sv:<{sv_w}}  {bv:<{bv_w}}  "
+                  f"{_c('1;33', verdict)}")
+        print()
+
+    if unresolved:
+        warn(f"Could not map {len(unresolved)} package.xml dependency key(s); "
+             "they are not part of the ABI comparison:")
+        print("    " + ", ".join(sorted(unresolved)))
+
+    not_comparable = len(absent) + len(unresolved)
 
     step("Summary")
     print(f"  {_c('0;32', 'in sync')}        : {len(matched)}")
     print(f"  {_c('1;33', 'mismatched')}     : {len(mismatches)}")
-    print(f"  one side only  : {len(missing)}")
-    print(f"  not comparable : {len(not_comparable)}")
+    print(f"  {_c('1;33', 'one side only')}  : {len(missing)}")
+    print(f"  not comparable : {not_comparable}")
 
 
 # -----------------------------------------------------------------------------
@@ -388,13 +515,90 @@ def confirm(prompt):
         return False
 
 
-def update_sysroot(sysroot, names):
-    """Upgrade the given packages to the LATEST available version inside the
-    sysroot. `names` is a list of apt package names. Single chroot call."""
+def refresh_sysroot_apt(sysroot):
     env = dict(os.environ, ARM64_SYSROOT=sysroot)
-    joined = " ".join(names)
-    snippet = f"apt-get update && apt-get install -y --only-upgrade {joined}"
-    info(f"Sysroot command: arm64-chroot bash -c \"{snippet}\"")
+    info("Sysroot command: arm64-chroot apt-get update")
+    res = subprocess.run(["arm64-chroot", "apt-get", "update"], env=env)
+    return res.returncode == 0
+
+
+def refresh_board_apt(ip, user, password):
+    q = shlex.quote(password)
+    remote = f"echo {q} | sudo -S -p '' apt-get update"
+    info(f"Board command: ssh {user}@{ip} '<sudo apt-get update>'")
+    res = subprocess.run(
+        ["sshpass", "-p", password, "ssh", *SSH_OPTS, f"{user}@{ip}", remote]
+    )
+    return res.returncode == 0
+
+
+def _parse_madison(text, names):
+    available = {name: set() for name in names}
+    for line in text.splitlines():
+        fields = [field.strip() for field in line.split("|")]
+        if len(fields) >= 2 and fields[0] in available and fields[1]:
+            available[fields[0]].add(fields[1])
+    return available
+
+
+def sysroot_available_versions(sysroot, names):
+    env = dict(os.environ, ARM64_SYSROOT=sysroot)
+    joined = " ".join(shlex.quote(name) for name in names)
+    snippet = f"apt-cache madison {joined}"
+    res = subprocess.run(
+        ["arm64-chroot", "bash", "-c", snippet],
+        capture_output=True, text=True, env=env,
+    )
+    if res.returncode != 0:
+        die(f"Could not query sysroot APT versions:\n{res.stderr.strip()}")
+    return _parse_madison(res.stdout, names)
+
+
+def board_available_versions(ip, user, password, names):
+    joined = " ".join(shlex.quote(name) for name in names)
+    res = _ssh(ip, user, password, f"apt-cache madison {joined}")
+    if res is None or res.returncode != 0:
+        die("Could not query board APT versions.\n"
+            f"{res.stderr.strip() if res else ''}")
+    return _parse_madison(res.stdout, names)
+
+
+def select_common_versions(names, sysroot_packages, board_packages,
+                           sysroot_available, board_available):
+    """Pick the newest version usable on both sides for every package.
+
+    An already-installed version is usable even if it has aged out of that
+    side's repository. The other side must either already have it or still be
+    able to download it.
+    """
+    targets, unavailable = {}, {}
+    for name in names:
+        sysroot_versions = set(sysroot_available.get(name, ()))
+        board_versions = set(board_available.get(name, ()))
+        if name in sysroot_packages:
+            sysroot_versions.add(sysroot_packages[name]["version"])
+        if name in board_packages:
+            board_versions.add(board_packages[name]["version"])
+        common = sysroot_versions & board_versions
+        if not common:
+            unavailable[name] = (sysroot_versions, board_versions)
+            continue
+        targets[name] = sorted(common, key=cmp_to_key(deb_compare))[-1]
+    return targets, unavailable
+
+
+def install_sysroot_exact(sysroot, targets, installed):
+    specs = [f"{name}={version}" for name, version in sorted(targets.items())
+             if name not in installed or installed[name]["version"] != version]
+    if not specs:
+        ok("Sysroot already has every selected exact version.")
+        return True
+    env = dict(os.environ, ARM64_SYSROOT=sysroot)
+    joined = " ".join(shlex.quote(spec) for spec in specs)
+    snippet = ("DEBIAN_FRONTEND=noninteractive apt-get install -y "
+               f"--allow-downgrades --no-remove {joined}")
+    info("Sysroot command: arm64-chroot apt-get install "
+         + " ".join(specs))
     res = subprocess.run(["arm64-chroot", "bash", "-c", snippet], env=env)
     return res.returncode == 0
 
@@ -419,15 +623,18 @@ def fix_sysroot(sysroot):
     return res.returncode == 0
 
 
-def update_board(ip, user, password, names):
-    """Upgrade the given packages to the LATEST available version on the board.
-    `names` is a list of apt package names. Single SSH call. SHARED HARDWARE."""
+def install_board_exact(ip, user, password, targets, installed):
+    specs = [f"{name}={version}" for name, version in sorted(targets.items())
+             if name not in installed or installed[name]["version"] != version]
+    if not specs:
+        ok("Board already has every selected exact version.")
+        return True
     q = shlex.quote(password)
-    joined = " ".join(names)
-    remote = (f"echo {q} | sudo -S apt-get update && "
-              f"echo {q} | sudo -S apt-get install -y --only-upgrade {joined}")
+    joined = " ".join(shlex.quote(spec) for spec in specs)
+    remote = (f"echo {q} | sudo -S -p '' env DEBIAN_FRONTEND=noninteractive "
+              f"apt-get install -y --allow-downgrades --no-remove {joined}")
     info(f"Board command: ssh {user}@{ip} "
-         f"'<sudo apt-get install -y --only-upgrade {joined}>'")
+         f"'<sudo apt-get install {' '.join(specs)}>'")
     res = subprocess.run(
         ["sshpass", "-p", password, "ssh", *SSH_OPTS, f"{user}@{ip}", remote]
     )
@@ -451,11 +658,9 @@ def main():
     ap.add_argument("--yes", action="store_true",
                     help="Apply updates without the interactive [y/N] gate.")
     ap.add_argument("--rosdep", action="store_true",
-                    help="For dependencies with no installed apt match, fall back "
-                         "to `rosdep resolve` inside the sysroot. Slow under QEMU "
-                         "and only useful for abstract system keys; off by default "
-                         "because unmatched deps are not installed on either side "
-                         "and thus cannot be version-mismatched anyway.")
+                    help="Deprecated compatibility option; unresolved keys are "
+                         "now always passed through rosdep so the ABI check cannot "
+                         "silently omit abstract system dependencies.")
     args = ap.parse_args()
 
     sysroot = args.sysroot
@@ -485,81 +690,108 @@ def main():
     ok("Board reachable.")
 
     step("Reading installed package versions")
-    board_v = board_dump(args.ip, args.user, args.password)
-    sysroot_v = sysroot_dump(sysroot)
+    board_packages = board_dump(args.ip, args.user, args.password)
+    sysroot_packages = sysroot_dump(sysroot)
 
-    resolved, stragglers = compare(community, sysroot_v, board_v)
-    if stragglers and args.rosdep:
-        info(f"Resolving {len(stragglers)} unmapped dependency(ies) via rosdep "
-             "(slow under QEMU)...")
-        extra = rosdep_resolve(stragglers, sysroot)
-        known = set(sysroot_v) | set(board_v)
-        still = []
-        for key in stragglers:
-            apt_names = extra.get(key, [])
-            chosen = next((a for a in apt_names if a in known), None)
-            if chosen:
-                resolved[key] = chosen
-            else:
-                still.append(key)
-        stragglers = still
+    resolved, unresolved = resolve_dependencies(
+        community, sysroot_packages, board_packages, sysroot
+    )
+    seeds = set().union(*resolved.values()) if resolved else set()
+    sysroot_closure = dependency_closure(seeds, sysroot_packages)
+    board_closure = dependency_closure(seeds, board_packages)
+    scope = seeds | sysroot_closure | board_closure
+    info(f"Dependency scope: {len(seeds)} direct Debian package(s), "
+         f"{len(scope)} package(s) including transitive Depends/Pre-Depends.")
 
-    matched, mismatches, missing, absent = build_report(resolved, sysroot_v, board_v)
-    print_report(matched, mismatches, missing, absent, stragglers)
+    matched, mismatches, missing, absent = build_report(
+        scope, seeds, sysroot_packages, board_packages
+    )
+    print_report(matched, mismatches, missing, absent, unresolved)
 
-    if not mismatches:
-        ok("All community packages are in sync between the sysroot and the board.")
+    drift = mismatches + missing
+    if not drift:
+        ok("All comparable direct and transitive dependency packages are "
+           "installed at identical versions in the sysroot and on the board.")
         return 0
 
     if args.check_only:
-        warn(f"{len(mismatches)} version mismatch(es) found (--check-only: no "
-             "changes made).")
+        warn(f"{len(drift)} dependency consistency error(s) found "
+             "(--check-only: no changes made).")
         return 2
 
-    # On any mismatch, bring BOTH the sysroot AND the board up to the latest
-    # available version of each mismatched package, so they converge at the
-    # newest release. The side that is already current is a harmless no-op.
-    update_pkgs = sorted({m["apt"] for m in mismatches})
+    update_pkgs = sorted({item["apt"] for item in drift})
 
     step("Proposed updates")
-    warn(f"{len(update_pkgs)} mismatched package(s) will be upgraded to the "
-         "LATEST available version on BOTH the sysroot AND the board "
-         "(board is SHARED LAB HARDWARE):")
-    for m in mismatches:
-        behind = "sysroot behind" if m["outdated"] == "sysroot" else "board behind"
-        print(f"    {m['apt']}  (sysroot={m['sysroot']}, board={m['board']}; "
-              f"{behind} -> latest)")
+    warn(f"APT metadata will be refreshed on both environments. Then "
+         f"{len(update_pkgs)} inconsistent package(s) will be installed at the "
+         "newest EXACT version available to BOTH environments (board is "
+         "SHARED LAB HARDWARE):")
+    for package in update_pkgs:
+        print(f"    {package}")
 
     if not args.yes and not confirm(
             _c("1;33", "\nApply these updates? [y/N] ")):
         warn("Aborted by user. No changes made.")
         return 2
 
+    step("Refreshing APT metadata")
+    if not refresh_sysroot_apt(sysroot):
+        err("Sysroot apt-get update failed; no packages were installed.")
+        return 1
+    if not refresh_board_apt(args.ip, args.user, args.password):
+        err("Board apt-get update failed; no packages were installed.")
+        return 1
+
+    step("Selecting exact common versions")
+    sysroot_available = sysroot_available_versions(sysroot, update_pkgs)
+    board_available = board_available_versions(
+        args.ip, args.user, args.password, update_pkgs
+    )
+    targets, unavailable = select_common_versions(
+        update_pkgs, sysroot_packages, board_packages,
+        sysroot_available, board_available,
+    )
+    if unavailable:
+        err("No common installable version exists for:")
+        for package, (sysroot_versions, board_versions) in unavailable.items():
+            print(f"    {package}: sysroot={sorted(sysroot_versions)} "
+                  f"board={sorted(board_versions)}", file=sys.stderr)
+        err("Use the same RDK/ROS APT snapshot on both environments, then retry.")
+        return 1
+    for package, version in sorted(targets.items()):
+        info(f"Selected {package}={version}")
+
     step("Updating sysroot")
-    if update_sysroot(sysroot, update_pkgs):
-        # Only relativise CMake paths once the upgrade actually succeeded; a
-        # failed/partial apt run leaves nothing new to fix.
+    if install_sysroot_exact(sysroot, targets, sysroot_packages):
         step("Fixing sysroot (sysroot-fix)")
         if not fix_sysroot(sysroot):
             warn("sysroot-fix reported a failure; check CMake paths manually.")
     else:
         err("Sysroot update reported a failure.")
-    step("Updating board")
-    if not update_board(args.ip, args.user, args.password, update_pkgs):
-        err("Board update reported a failure.")
-
-    # Re-read and reconcile.
-    step("Re-checking after update")
-    board_v = board_dump(args.ip, args.user, args.password)
-    sysroot_v = sysroot_dump(sysroot)
-    _matched2, mismatches2, _missing2, _absent2 = build_report(
-        resolved, sysroot_v, board_v)
-    if mismatches2:
-        warn(f"{len(mismatches2)} package(s) still mismatched after update:")
-        for m in mismatches2:
-            print(f"    {m['apt']}: sysroot={m['sysroot']} board={m['board']}")
         return 1
-    ok("All previously mismatched packages are now in sync.")
+
+    step("Updating board")
+    if not install_board_exact(
+            args.ip, args.user, args.password, targets, board_packages):
+        err("Board update reported a failure.")
+        return 1
+
+    step("Re-checking after update")
+    board_packages2 = board_dump(args.ip, args.user, args.password)
+    sysroot_packages2 = sysroot_dump(sysroot)
+    sysroot_closure2 = dependency_closure(seeds, sysroot_packages2)
+    board_closure2 = dependency_closure(seeds, board_packages2)
+    scope2 = seeds | sysroot_closure2 | board_closure2
+    matched2, mismatches2, missing2, absent2 = build_report(
+        scope2, seeds, sysroot_packages2, board_packages2
+    )
+    print_report(matched2, mismatches2, missing2, absent2, unresolved)
+    if mismatches2 or missing2:
+        warn("Dependency versions are still inconsistent after the update. "
+             "No successful consistency result will be reported.")
+        return 1
+    ok("All comparable direct and transitive dependency packages are now "
+       "installed at identical versions.")
     return 0
 
 

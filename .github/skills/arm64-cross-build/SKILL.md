@@ -1,6 +1,6 @@
 ---
 name: arm64-cross-build
-description: Use this skill when an AI agent needs to build, clean, or install dependencies in this ARM64 ROS 2 Jazzy cross-compilation workspace. Triggers include "build the workspace", "rebuild package X", "install rosdep deps", "clean build", "fix the cross compile", or any colcon-related task in this repo.
+description: Use this skill when an AI agent needs to build, clean, or install dependencies in this ARM64 ROS 2 Jazzy cross-compilation workspace, or to diagnose a build failure in it. Triggers include "build the workspace", "rebuild package X", "install rosdep deps", "clean build", "fix the cross compile", "CMake can't find package X", "rebuild still fails after rosdep install", "urdfdom not found", "sysroot path is wrong", "build fails with -Werror", "conversion warning treated as error", "all warnings being treated as errors", "builds for one board but fails for another", or any colcon-related task in this repo.
 ---
 
 # ARM64 Cross Build
@@ -28,7 +28,8 @@ Apply this skill for **any** of:
 |-------------------|------------------------------------------------------|
 | Host              | Ubuntu dev container, `x86_64` or `arm64`            |
 | Target            | aarch64, Renesas ARM64, ROS 2 Jazzy                  |
-| Toolchain         | `/home/ubuntu/toolchains/cross.cmake`                |
+| Toolchain         | `/home/ubuntu/toolchains/cross.cmake` (copy of the `$PRODUCT` variant) |
+| Toolchain variants| `/home/ubuntu/toolchains/<product>_cross.cmake`, one per board; they differ in target CPU **and warning strictness** |
 | Compiler          | `aarch64-linux-gnu-gcc` / `g++` (C++17)              |
 | Sysroot           | `$ARM64_SYSROOT` (must be exported)                    |
 | Workspace root    | `$HOME/ros2_ws` (`/home/ubuntu/ros2_ws`)             |
@@ -85,18 +86,59 @@ Rules:
 ## Build-failure decision tree
 
 1. `cross-colcon-build: command not found` → not in dev container.
-2. `find_package(...) ... not found` → run `sysroot-rosdep-install`,
-   then re-build.
-3. Linker error referencing a symbol that exists on host → a host
+2. `find_package(...) ... not found` → run the discriminator:
+   `find "$ARM64_SYSROOT" -name "<pkg>*onfig.cmake"`.
+   - Config **exists** in the sysroot but `find_package` still misses it
+     → read `references/configure-errors.md` before changing anything.
+   - Config **does not exist** → `sysroot-rosdep-install`, then rebuild.
+3. Compile error carrying a `[-Werror=<name>]` / `[-W<name>]` bracket
+   tag, or `cc1plus: all warnings being treated as errors` → the active
+   toolchain variant's warning policy, not a code defect per se. **Stop
+   and ask the user** (fix the code vs. relax `CMakeLists.txt`) — read
+   `references/strict-flag-errors.md` before touching anything.
+4. Linker error referencing a symbol that exists on host → a host
    library leaked in. Re-check `CMakeLists.txt` for absolute `/usr/...`
    paths or non-`ament_*` `find_package` calls.
-4. ABI / `GLIBC_x.y not found` at link time → the package is using a
+5. ABI / `GLIBC_x.y not found` at link time → the package is using a
    host toolchain instead of the cross one. Confirm
    `CMAKE_TOOLCHAIN_FILE=/home/ubuntu/toolchains/cross.cmake` is set
    (it is, by `cross-colcon-build`).
-5. After source changes seem ignored → `rm -rf build/install/log/` and
+6. After source changes seem ignored → `rm -rf build/install/log/` and
    rebuild. Colcon's incremental cache occasionally lies for cross
    builds.
+
+## Toolchain warning strictness
+
+One toolchain file per supported board lives in `/home/ubuntu/toolchains/`
+as `<product>_cross.cmake`; the entrypoint copies the one `$PRODUCT`
+selects over `cross.cmake`. Each sets its own `ARM_COMPILE_OPTION` —
+target CPU plus a warning policy — and **the policies differ in
+strictness**. Lax variants add only format-security hardening; strict
+ones also enable broad warning sets and promote them to errors
+(`-Wall`, `-Wextra`, `-Wconversion`, `-Werror`, `-pedantic-errors`, …).
+
+Consequence: code that compiles clean under one variant can fail under
+another with no change to the source, the sysroot, or the cache. A
+conversion warning may not even be emitted on one board and be a hard
+error on the next.
+
+The variant list grows. Never answer from a remembered table — read the
+active policy:
+
+```bash
+ls /home/ubuntu/toolchains/*_cross.cmake                       # what exists
+grep -m1 ARM_COMPILE_OPTION /home/ubuntu/toolchains/cross.cmake  # what is in force
+```
+
+When a strict-flag failure hits, the fix is a **user decision**, not
+yours — fixing the code and relaxing the build policy are different
+tradeoffs. Present the diagnostics, ask via `AskUserQuestion` (1. fix the
+code, 2. relax `CMakeLists.txt`), and implement only what they choose.
+Full procedure, scope ladder, and the verified `-Wno-error=` naming
+gotcha are in `references/strict-flag-errors.md`.
+
+Never "solve" a warning by pointing `PRODUCT` at a laxer variant — that
+retargets the CPU and builds for the wrong board.
 
 ## Anti-patterns
 
@@ -104,6 +146,11 @@ Rules:
   may link against the container rootfs instead of the board image ABI.
 - Adding `--cmake-args` for typical packages — the toolchain already
   configures everything needed.
+- `-DCMAKE_CXX_FLAGS=...` to quiet warnings — the variant's `-mcpu`
+  guard then skips its **whole** flag block, silently dropping the
+  hardening options too. Scope the change to a target instead.
+- Editing `cross.cmake` or any `<product>_cross.cmake` — tracked with the
+  toolchain and overwritten on the next container update.
 - Putting build artifacts anywhere except `build/`, `install/`, `log/`.
 - `pip install` to "fix" a missing ROS dep — use `rosdep` / package.xml.
 
@@ -215,6 +262,10 @@ paraphrasing:
 
 ## Cross-references
 
+- CMake configure errors this tree doesn't resolve →
+  `references/configure-errors.md`.
+- Compile errors from a strict variant's `-Werror` / `-Wconversion` /
+  `-pedantic-errors` → `references/strict-flag-errors.md`.
 - Package layout, naming, formatting → `arm64-ros2-package-conventions`.
 - Pushing the resulting `install/` to the board → `arm64-deploy-debug`.
 - Verifying behavior on the board after a build → `arm64-target-autonomous-test`.

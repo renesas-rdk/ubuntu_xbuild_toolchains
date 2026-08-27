@@ -244,6 +244,7 @@ if [ -d "$ROS2_WS_DIR" ] && [ "$ROS2_WS_DIR" != "$TOOLCHAIN_DIR" ]; then
   link_skill "$TOOLCHAIN_DIR/.vscode"       "$ROS2_WS_DIR/.vscode"
   link_skill "$TOOLCHAIN_DIR/.github"       "$ROS2_WS_DIR/.github"
   link_skill "$TOOLCHAIN_DIR/.claude"       "$ROS2_WS_DIR/.claude"
+  link_skill "$TOOLCHAIN_DIR/.agents"       "$ROS2_WS_DIR/.agents"
   link_skill "$TOOLCHAIN_DIR/AGENTS.md"     "$ROS2_WS_DIR/AGENTS.md"
   link_skill "$TOOLCHAIN_DIR/.clang-format" "$ROS2_WS_DIR/.clang-format"
   echo "[INFO] Agent skill files symlinked to $ROS2_WS_DIR."
