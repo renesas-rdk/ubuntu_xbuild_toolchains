@@ -47,9 +47,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - image: ghcr.io/renesas-rdk/rzv2h_ubuntu_xbuild:latest
+          - image: ghcr.io/renesas-rdk/rzv2h_ubuntu_xbuild:multiarch
             product: V2H
-          - image: ghcr.io/renesas-rdk/rcarv4h_ubuntu_xbuild:latest
+          - image: ghcr.io/renesas-rdk/rcarv4h_ubuntu_xbuild:multiarch
             product: V4H
     steps:
       # The released image bundles a full Ubuntu + ROS sysroot; free headroom.

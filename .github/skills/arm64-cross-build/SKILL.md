@@ -192,7 +192,7 @@ workspace ships a one-shot helper to pull / start / shell in:
 
 Defaults:
 
-- Image: `ghcr.io/renesas-rdk/rzv2h_ubuntu_xbuild:latest`
+- Image: `ghcr.io/renesas-rdk/rzv2h_ubuntu_xbuild:multiarch`
 - Container: `ros2_cross_build_container`
 - Bind mount: `$HOME/ros2_ws` → `/home/ubuntu/ros2_ws`
 

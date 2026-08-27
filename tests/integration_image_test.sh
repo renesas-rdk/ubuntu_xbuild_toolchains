@@ -15,7 +15,7 @@
 #      must produce an ARM aarch64 shared object.
 #
 # Usage: integration_image_test.sh [IMAGE] [PRODUCT]
-#   IMAGE    default ghcr.io/renesas-rdk/rzv2h_ubuntu_xbuild:latest
+#   IMAGE    default ghcr.io/renesas-rdk/rzv2h_ubuntu_xbuild:multiarch
 #   PRODUCT  V2H (default) or V4H — must match the image
 #
 # Needs docker with privileged containers and (on non-arm64 hosts) QEMU binfmt
@@ -28,7 +28,7 @@ REPO="$(cd "$HERE/.." && pwd)"
 # shellcheck source=tests/lib/assert.sh
 source "$HERE/lib/assert.sh"
 
-IMAGE="${1:-ghcr.io/renesas-rdk/rzv2h_ubuntu_xbuild:latest}"
+IMAGE="${1:-ghcr.io/renesas-rdk/rzv2h_ubuntu_xbuild:multiarch}"
 PRODUCT="${2:-V2H}"
 case "$PRODUCT" in
     V2H) PRODUCT_CMAKE="v2h_cross.cmake" ;;
