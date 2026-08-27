@@ -15,6 +15,9 @@
 # user (cases 6 & 7); an untracked file that a new release would overwrite makes
 # the update fail safe instead (cases 9 & 10). Case 8 covers seeding the
 # gitignored sysroot-fix-append.yaml from its template without clobbering edits.
+# A third contract: a release that rewrites entrypoint.sh itself must take effect
+# on the start that installs it, via a single re-exec of the fresh script, and
+# must not re-exec when the release leaves the entrypoint alone (cases 11 & 12).
 #
 # The entrypoint is driven DIRECTLY (not through a built image) against a
 # throwaway toolchain checkout wired to a local bare git remote, with the
@@ -123,6 +126,9 @@ set_latest_release() {
 
 # run_entry BASE [CMD...] — run the entrypoint from the sandbox with a hermetic
 # env, ending in CMD (default: print a startup sentinel). Captures stdout+stderr.
+# The timeout is a backstop: the entrypoint re-execs itself when a release
+# rewrites it (case 11), so a regression that made that loop would otherwise
+# hang the whole suite instead of failing the case.
 run_entry() {
     local base="$1"; shift
     local tc="$base/toolchains"
@@ -135,7 +141,7 @@ run_entry() {
         TOOLCHAIN_API_BASE="file://$base/ghapi" \
         ROS2_WS="$base/no_ros2_ws" \
         PRODUCT="V2H" \
-        bash "$tc/entrypoint.sh" "$@" 2>&1
+        timeout 120 bash "$tc/entrypoint.sh" "$@" 2>&1
 }
 
 # NOTE: plain first-start / restart / wrapper-symlink cases used to live here;
@@ -357,5 +363,74 @@ it "10.2 HEAD advanced to the release tag"
 it "10.3 the untracked user file survived the update"
 grep -q "my scratch notes" "$tc/my-notes.txt" \
     && _pass "$CURRENT_TEST" || _fail "$CURRENT_TEST" "untracked file was lost"
+
+# =============================================================================
+# 11. A release that rewrites entrypoint.sh ITSELF takes effect on the SAME start
+#     The running shell holds the OLD script, so without a re-exec every step
+#     after the checkout — the wrapper symlinks, the seeding, the workspace
+#     skill symlinks — stays the PREVIOUS release's, and anything a release ADDS
+#     there lands one restart late. The entrypoint must re-exec the fresh copy,
+#     and must do the update work exactly once: one checkout, one re-exec, no
+#     loop, and the container's CMD still reached at the end.
+# =============================================================================
+base="$(make_sandbox)"
+tc="$base/toolchains"
+work="$(mktemp -d)"; SANDBOXES+=("$work")
+git clone -q --branch main "$base/remote.git" "$work/c"
+( cd "$work/c" || exit 1
+  # This release adds a startup step that exists ONLY in its entrypoint.sh, so
+  # the sentinel below can only be printed by the new script — proving startup
+  # continued on the checked-out copy rather than the one that began the start.
+  sed -i 's|^echo "--- Startup Complete ---"|echo "NEW_STEP_FROM_RELEASE"\necho "--- Startup Complete ---"|' entrypoint.sh
+  git add -A >/dev/null
+  git "${GIT_ID[@]}" commit -qm release-changes-entrypoint
+  git tag v1.0.0
+  git push -q origin HEAD:main >/dev/null 2>&1
+  git push -q origin refs/tags/v1.0.0 >/dev/null 2>&1 )
+set_latest_release "$base" "v1.0.0"
+
+out="$(run_entry "$base")"
+
+it "11.1 the changed entrypoint is detected and startup is restarted on it"
+assert_contains "$out" "entrypoint.sh changed in v1.0.0"
+
+it "11.2 the release's NEW startup step runs on this very start"
+assert_contains "$out" "NEW_STEP_FROM_RELEASE"
+
+it "11.3 startup completes exactly once (the re-exec replaces the old pass)"
+n="$(printf '%s\n' "$out" | grep -c -- "--- Startup Complete ---")"
+[ "$n" = "1" ] && _pass "$CURRENT_TEST" || _fail "$CURRENT_TEST" "expected 1 completion, got $n"
+
+it "11.4 the CMD still runs after the re-exec"
+assert_contains "$out" "CMD_SENTINEL"
+
+it "11.5 the update work is not repeated — one checkout, one re-exec"
+n="$(printf '%s\n' "$out" | grep -c "checked out release v1.0.0")"
+m="$(printf '%s\n' "$out" | grep -c "restarting startup with the new script")"
+[ "$n" = "1" ] && [ "$m" = "1" ] && _pass "$CURRENT_TEST" \
+    || _fail "$CURRENT_TEST" "checkouts=$n re-execs=$m (expected 1 and 1)"
+
+it "11.6 HEAD is at the release tag after the re-exec"
+[ "$(git -C "$tc" rev-parse HEAD)" = "$(git -C "$tc" rev-parse v1.0.0)" ] \
+    && _pass "$CURRENT_TEST" || _fail "$CURRENT_TEST" "HEAD is not at v1.0.0"
+
+# =============================================================================
+# 12. A release that leaves entrypoint.sh alone does NOT re-exec — the common
+#     case must not pay for a second startup pass, and the post-update steps
+#     must still run exactly once.
+# =============================================================================
+base="$(make_sandbox)"
+tag_remote "$base" "v1.0.0" "release-one"        # touches RELEASE_CHANGE only
+set_latest_release "$base" "v1.0.0"
+
+out="$(run_entry "$base")"
+
+it "12.1 unchanged entrypoint -> no re-exec"
+assert_not_contains "$out" "restarting startup with the new script"
+
+it "12.2 startup still runs the post-update steps, exactly once"
+assert_contains "$out" "checked out release v1.0.0"
+n="$(printf '%s\n' "$out" | grep -c "Updating DNS configuration")"
+[ "$n" = "1" ] && _pass "$CURRENT_TEST" || _fail "$CURRENT_TEST" "startup ran $n times, expected 1"
 
 finish

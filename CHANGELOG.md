@@ -12,6 +12,10 @@
 - The `arm64-cross-build` skill now covers the per-board `<product>_cross.cmake` variants, whose warning strictness differs - the same source can build for one board and fail on another. On a strict-flag failure the agent asks the user before fixing the code or relaxing `CMakeLists.txt`.
 - `check_package_versions.py` now compares the full Debian dependency closure of each side, requires every direct dependency on both sides, and syncs to the newest version available to both instead of upgrading each side to its own latest.
 
+### Fixed
+
+- - A release that changes `entrypoint.sh` now takes effect on the start that installs it. Previously the running shell kept executing the *previous* release's script after the checkout, so the `/usr/local/bin` wrapper symlinks, template seeding, and workspace skill symlinks stayed one release behind — anything a release added there needed a second `docker restart` to appear. The entrypoint now re-execs the freshly checked-out copy of itself, passing the resolved tag in `TOOLCHAIN_REEXEC_RELEASE` so the update isn't resolved, fetched, or applied twice. It re-execs at most once per start, and only when `entrypoint.sh` actually changed.
+
 ## [1.2.0] - 2026-07-11
 
 ### Upgrade notice

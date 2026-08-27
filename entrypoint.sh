@@ -42,6 +42,15 @@ echo "DNS updated in sysroot."
 
 TOOLCHAIN_DIR="${TOOLCHAINS_WS:-/home/ubuntu/toolchains}"
 
+# Absolute path to THIS script, resolved before the auto-update block `cd`s
+# away, so the post-update re-exec below can run the freshly checked-out copy of
+# itself. self_sum fingerprints that file to tell "the release rewrote it" from
+# "it is unchanged"; with no md5sum it returns a constant, so the two readings
+# always compare equal and the re-exec simply never fires.
+SELF="$0"
+case "$SELF" in /*) ;; *) SELF="$PWD/$SELF";; esac
+self_sum() { md5sum "$SELF" 2>/dev/null || echo "no-md5sum"; }
+
 # === Symlink helper scripts (always, before auto-update) ===
 for pair in \
   "arm64-chroot.sh:arm64-chroot" \
@@ -65,21 +74,37 @@ if [ -d "$TOOLCHAIN_DIR/.git" ]; then
   git config user.name "Container" 2>/dev/null || true
 
   updated=0
-  # Resolve the latest PUBLISHED release from the GitHub API (excludes drafts and
-  # pre-releases). OWNER/REPO is derived from origin, stripping any embedded
-  # credentials and the .git suffix. Parsed with grep/sed so no jq is needed.
-  # TOOLCHAIN_API_BASE overrides the API host (a GitHub Enterprise mirror, or a
-  # local mock in the integration test); it defaults to the public API.
-  api_base="${TOOLCHAIN_API_BASE:-https://api.github.com}"
-  slug="$(git remote get-url origin 2>/dev/null | sed -E 's#^.*github\.com[:/]##; s#\.git$##')"
-  latest=""
-  if [ -n "$slug" ]; then
-    latest="$(timeout 15 curl -fsSL -H 'Accept: application/vnd.github+json' \
-      "$api_base/repos/$slug/releases/latest" 2>/dev/null \
-      | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
+  self_sum_before="$(self_sum)"
+
+  if [ -n "${TOOLCHAIN_REEXEC_RELEASE:-}" ]; then
+    # We are the second pass: an earlier pass checked this release out and
+    # re-exec'd us because the release rewrote entrypoint.sh itself (see the
+    # re-exec below). The tree already sits on the release, so skip resolving
+    # and fetching it a second time and drop straight into the post-update
+    # steps — this script's versions of them.
+    latest="$TOOLCHAIN_REEXEC_RELEASE"
+    unset TOOLCHAIN_REEXEC_RELEASE
+    updated=1
+  else
+    # Resolve the latest PUBLISHED release from the GitHub API (excludes drafts
+    # and pre-releases). OWNER/REPO is derived from origin, stripping any
+    # embedded credentials and the .git suffix. Parsed with grep/sed so no jq is
+    # needed. TOOLCHAIN_API_BASE overrides the API host (a GitHub Enterprise
+    # mirror, or a local mock in the integration test); it defaults to the
+    # public API.
+    api_base="${TOOLCHAIN_API_BASE:-https://api.github.com}"
+    slug="$(git remote get-url origin 2>/dev/null | sed -E 's#^.*github\.com[:/]##; s#\.git$##')"
+    latest=""
+    if [ -n "$slug" ]; then
+      latest="$(timeout 15 curl -fsSL -H 'Accept: application/vnd.github+json' \
+        "$api_base/repos/$slug/releases/latest" 2>/dev/null \
+        | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
+    fi
   fi
 
-  if [ -z "$latest" ]; then
+  if [ "$updated" -eq 1 ]; then
+    : # already checked out by the pass that re-exec'd us — nothing to resolve
+  elif [ -z "$latest" ]; then
     echo "[WARN] No published release resolved (offline / none) — using local toolchain."
   elif ! timeout 15 git fetch --force origin "refs/tags/$latest:refs/tags/$latest" >/dev/null 2>&1; then
     echo "[WARN] Could not fetch release $latest — using local toolchain."
@@ -137,6 +162,23 @@ if [ -d "$TOOLCHAIN_DIR/.git" ]; then
   fi
 
   if [ "$updated" -eq 1 ]; then
+    # The release just checked out may have rewritten entrypoint.sh ITSELF,
+    # while this process still runs the OLD script — so every step below, and
+    # the wrapper and skill symlink lists, would be the PREVIOUS release's, and
+    # anything a release adds there would land one restart late. Re-exec the
+    # fresh copy, passing the resolved tag in TOOLCHAIN_REEXEC_RELEASE so it
+    # knows the checkout is done and does not resolve, fetch or apply again.
+    #
+    # It fires at most once per start: on the second pass both fingerprints read
+    # the new file, so they match and it falls through. If $0 is not the file
+    # git updated (a copy baked elsewhere in the image), the fingerprint is
+    # unchanged too and startup continues here.
+    if [ "$self_sum_before" != "$(self_sum)" ]; then
+      echo "[INFO] entrypoint.sh changed in $latest — restarting startup with the new script."
+      export TOOLCHAIN_REEXEC_RELEASE="$latest"
+      exec bash "$SELF" "$@"
+    fi
+
     # Normalize product cmake files
     product="${PRODUCT:-V2H}"
     case "$product" in
