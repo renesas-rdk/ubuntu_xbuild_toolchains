@@ -60,7 +60,7 @@ Read from `.vscode/settings.json` — never hard-code:
 | `TARGET_PASSWORD`    | `.vscode/settings.json`             |
 | `TARGET_ROS2_WS`     | `.vscode/settings.json`             |
 
-Pull them with `grep_search` or a small JSON read. If a value is
+Read them from the file (grep or a small JSON read). If a value is
 missing, stop and ask.
 
 ## 2. Non-interactive SSH/rsync via sshpass
@@ -102,7 +102,7 @@ Notes:
 Before any mutation, run a small probe and stop on anything unexpected:
 
 ```bash
-uname -a                 # expect aarch64, Linux 6.10.x-arm64-renesas
+uname -a                 # expect aarch64 with a Renesas kernel
 date -u                  # clock sanity (TLS / log timestamps depend on it)
 systemctl --no-pager --failed | head
 df -h /                  # need >1G typically
@@ -191,11 +191,14 @@ Surface, in order:
 
 1. What you ran (single sentence).
 2. Exit code / unit state of the thing under test.
-3. Up to ~10 lines of the most relevant `journalctl` excerpt.
+3. The relevant `journalctl` excerpt — a grep'd slice around the lines
+   that decide the result, not the whole log.
 4. Any state left behind on the device (files, running containers,
    modified units).
 
-Prefer pasting a small grep'd slice over dumping a 200-line log.
+Every claim in the report must trace to a command output from this
+session. If something was not checked, say so rather than inferring it
+from a green exit code elsewhere.
 
 ## 8. Anti-patterns
 
@@ -238,26 +241,7 @@ wait \$APP 2>/dev/null || true
 REMOTE
 ```
 
-### Example B: r365_rdk_ota agent / app stack verification
-
-The r365 stack uses three units and a filesystem inbox. After a
-`./ota.sh package-target` deploy you can verify with:
-
-| What                | Command                                                  |
-|---------------------|----------------------------------------------------------|
-| Agent state         | `systemctl is-active r365-agent`                         |
-| App state           | `systemctl is-active ros2-app`                           |
-| Bridge state        | `systemctl is-active fluentbit-ros-bridge`               |
-| Inbox queue         | `ls -la /var/lib/r365/tasks/{inbox,processed,failed}`    |
-| Current app env     | `cat /var/lib/r365/state/current-app.env`                |
-| Compose stacks      | `docker compose ls` (and `docker ps`)                    |
-
-Common live target paths for this stack:
-`/var/lib/r365/`, `/etc/systemd/system/{r365-agent,ros2-app,fluentbit-ros-bridge}*`,
-`/opt/r365/bridge/`. Installer + provision script in this repo:
-`utils/r365_rdk_ota/output/target/` after `./ota.sh package-target`.
-
-### Example C: capturing a bag for offline analysis
+### Example B: capturing a bag for offline analysis
 
 ```bash
 sshpass ... ssh ... bash -s <<REMOTE

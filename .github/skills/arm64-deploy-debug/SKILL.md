@@ -30,8 +30,8 @@ All target parameters come from `.vscode/settings.json`:
 | `TARGET_IP`               | every task / launch                              |
 | `TARGET_USER`             | every task / launch                              |
 | `TARGET_PASSWORD`         | every task / launch (sshpass)                    |
-| `TARGET_ROS2_WS`          | `ROS2: Deploy to Target`                         |
-| `TARGET_LOCAL_SYSROOT`    | GDB launch configs                               |
+| `TARGET_ROS2_WS`          | `ROS2: Deploy to Target`, `ROS2: Install Deps on Target (rosdep)` |
+| `TARGET_LOCAL_SYSROOT`    | GDB launch configs, `ROS2: Check Package Versions (Sysroot and Board)` |
 | `TARGET_GDB_PORT`         | GDB tasks + launch configs                       |
 | `NODE_PACKAGE_NAME`       | `ROS2: Run Package Executable`, GDB Run          |
 | `NODE_EXECUTABLE_NAME`    | `ROS2: Run Package Executable`, GDB              |
@@ -43,7 +43,12 @@ the user — do not guess.
 
 ## Standard tasks (preferred entry points)
 
-Run via the workspace's VS Code tasks (`run_task` / Tasks: Run Task):
+Run via the workspace's VS Code tasks (**Tasks: Run Task**, or the
+harness's task-runner tool if it has one). If the harness cannot run VS
+Code tasks, read the task's `command` from `.vscode/tasks.json` and run
+it from the workspace root with the `${config:*}` values substituted
+from `.vscode/settings.json` — reuse the task's exact command rather
+than reinventing it.
 
 | Task label                           | Purpose                                              |
 |--------------------------------------|------------------------------------------------------|
@@ -56,6 +61,8 @@ Run via the workspace's VS Code tasks (`run_task` / Tasks: Run Task):
 | `ROS2: Debug Launch (GDB)`           | starts gdbserver under a launch file                 |
 | `ROS2: SSH to Target`                | interactive SSH shell                                |
 | `ROS2: Clean All`                    | wipe `build/`, `install/`, `log/`                    |
+| `ROS2: Install Deps on Target (rosdep)` | install runtime rosdep keys on the board from the deployed `install/` |
+| `ROS2: Check Package Versions (Sysroot and Board)` | compare library versions in the sysroot vs. on the board (ABI check) |
 
 GDB attach is then handled by the launch configurations
 `GDB for ROS2 Run` and `GDB for ROS2 Launch`. Prefer launch configs
@@ -74,6 +81,10 @@ that auto-deploy via `dependsOn`.
 5. User says "ssh / shell" → `ROS2: SSH to Target` (this opens an
    interactive terminal — the agent should not try to script it; if
    scripting is needed, switch to `arm64-target-autonomous-test`).
+6. A run fails on the board with a missing shared library or Python
+   module → `ROS2: Install Deps on Target (rosdep)`. If the library is
+   present but the wrong version → `ROS2: Check Package Versions
+   (Sysroot and Board)` to confirm the sysroot/board ABI mismatch.
 
 ## Anti-patterns
 
@@ -120,7 +131,8 @@ run/debug task fails immediately, check these before debugging task
 scripts:
 
 - **Runtime rosdep keys.** After the very first deploy of a new
-  package set, install runtime deps on the board:
+  package set, run `ROS2: Install Deps on Target (rosdep)`. It executes
+  this on the board over SSH:
   ```bash
   source /opt/ros/jazzy/setup.bash
   cd "$TARGET_ROS2_WS"

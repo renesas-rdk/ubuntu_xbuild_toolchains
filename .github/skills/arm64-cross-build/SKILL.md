@@ -1,6 +1,6 @@
 ---
 name: arm64-cross-build
-description: Use this skill when an AI agent needs to build, clean, or install dependencies in this ARM64 ROS 2 Jazzy cross-compilation workspace, or to diagnose a build failure in it. Triggers include "build the workspace", "rebuild package X", "install rosdep deps", "clean build", "fix the cross compile", "CMake can't find package X", "rebuild still fails after rosdep install", "urdfdom not found", "sysroot path is wrong", "build fails with -Werror", "conversion warning treated as error", "all warnings being treated as errors", "builds for one board but fails for another", or any colcon-related task in this repo.
+description: Use this skill for any colcon or cross-compile task in this ARM64 ROS 2 Jazzy workspace — building or cleaning, installing rosdep/apt dependencies into the sysroot, or diagnosing a build failure. Build-failure triggers include CMake `find_package` misses ("can't find package X", "still fails after rosdep install"), sysroot path problems, strict-warning failures ("-Werror", "conversion warning treated as error", "all warnings being treated as errors"), and builds that pass on one board but fail on another.
 ---
 
 # ARM64 Cross Build
@@ -37,7 +37,8 @@ Apply this skill for **any** of:
 | Build outputs     | `build/`, `install/`, `log/` at workspace root       |
 
 If `cross-colcon-build` is not on `PATH` or `$ARM64_SYSROOT` is unset, the
-agent is outside the dev container — stop and tell the user.
+agent is outside the dev container — stop and tell the user, pointing at
+"Bringing up / refreshing the dev container" below.
 
 ## Build commands (copy-pasteable)
 
@@ -106,6 +107,10 @@ Rules:
 6. After source changes seem ignored → `rm -rf build/install/log/` and
    rebuild. Colcon's incremental cache occasionally lies for cross
    builds.
+
+A fix is done when the same `cross-colcon-build` invocation that failed
+exits 0. Report that result as observed; a green configure step or a
+partial rebuild is not evidence the package compiles.
 
 ## Toolchain warning strictness
 
@@ -184,21 +189,28 @@ If you genuinely need to change a protected flag, edit
 ## Bringing up / refreshing the dev container
 
 If the agent is on the host (not yet inside the dev container), the
-workspace ships a one-shot helper to pull / start / shell in:
+one-shot helper that pulls / starts / shells into the container comes
+from the separate `renesas-rdk/ros2_demo_workspace` repo — it is not
+part of this workspace unless that repo has been cloned into it:
 
 ```bash
-./setup_rdk_docker.sh -y --pull --create --prep --shell
+curl -fsSLO https://github.com/renesas-rdk/ros2_demo_workspace/raw/refs/heads/main/common_utils/setup_rdk_docker.sh
+chmod +x setup_rdk_docker.sh
+# <platform> is rcarv4h or rzv2h (default rzv2h) — pick the one that matches the board.
+./setup_rdk_docker.sh <platform> -y --pull --create --shell
 ```
 
 Defaults:
 
-- Image: `ghcr.io/renesas-rdk/rzv2h_ubuntu_xbuild:multiarch`
+- Image: `ghcr.io/renesas-rdk/<platform>_ubuntu_xbuild:multiarch`
 - Container: `ros2_cross_build_container`
 - Bind mount: `$HOME/ros2_ws` → `/home/ubuntu/ros2_ws`
 
-The `--prep` step is what installs `cross-colcon-build`, sets
-`$ARM64_SYSROOT`, and primes `arm64-chroot`. Re-run with `--pull` to pick
-up a new image (e.g. after a sysroot bump).
+The image provides `cross-colcon-build`, `arm64-chroot`, and
+`$ARM64_SYSROOT`; the container entrypoint copies the `$PRODUCT`
+toolchain variant over `cross.cmake` and seeds `.vscode/` into the
+workspace. Re-run with `--pull` to pick up a new image (e.g. after a
+sysroot bump).
 
 ## How the cross-build actually works (mental model)
 
@@ -236,14 +248,18 @@ Consequences the agent must respect:
 
 ## Restoring `.vscode/` and `.clang-format`
 
-The `--prep` phase of `setup_rdk_docker.sh` copies these from
-`$TOOLCHAINS_WS` (the toolchain directory inside the container,
-usually `/home/ubuntu/toolchains/`) into the workspace root. If a user
-deleted them or opened a fresh workspace:
+On container start the entrypoint symlinks these from `$TOOLCHAINS_WS`
+(the toolchain directory inside the container, usually
+`/home/ubuntu/toolchains/`) into the workspace root — but only when the
+workspace has no real file or directory of that name yet. An existing
+copy is kept as-is, so it can fall behind the toolchain version (a task
+in `tasks.json` referencing a script that is missing from `.vscode/` is
+the usual symptom). To add the missing files without overwriting
+user-edited ones such as `settings.json`:
 
 ```bash
-cp -r "$TOOLCHAINS_WS/.vscode" "$ROS2_WS/"
-cp    "$TOOLCHAINS_WS/.clang-format" "$ROS2_WS/"
+cp -rn "$TOOLCHAINS_WS/.vscode/." "$ROS2_WS/.vscode/"
+cp -n  "$TOOLCHAINS_WS/.clang-format" "$ROS2_WS/"
 ```
 
 Do not hand-write these files — they're versioned with the toolchain.
