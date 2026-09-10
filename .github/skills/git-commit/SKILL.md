@@ -75,9 +75,6 @@ git add path/to/file1 path/to/file2
 # Stage by pattern
 git add *.test.*
 git add src/components/*
-
-# Interactive staging
-git add -p
 ```
 
 **Never commit secrets** (.env, credentials.json, private keys).
@@ -110,16 +107,18 @@ EOF
 ## Best Practices
 
 - One logical change per commit
-- Prefer unscoped commits unless a scope is explicitly requested
 - Present tense: "add" not "added"
 - Imperative mood: "fix bug" not "fixes bug"
 - Reference issues: `Closes #123`, `Refs #456`
 - Keep description under 72 characters
 
-## Git Safety Protocol
+## Git Safety
 
-- NEVER update git config
-- NEVER run destructive commands (--force, hard reset) without explicit request
-- NEVER skip hooks (--no-verify) unless user asks
-- NEVER force push to main/master
-- If commit fails due to hooks, fix and create NEW commit (don't amend)
+- Do not change git config; commit with the identity already configured.
+- Destructive commands (`--force`, hard reset, force-push) and `--no-verify`
+  only when the user explicitly asks — they discard history or bypass checks
+  other people rely on.
+- If a hook rejects the commit, fix the cause and create a new commit rather
+  than amending, so the hook runs again on the final content.
+- Interactive git (`git add -p`, `git add -i`, `git rebase -i`) is not
+  available to the agent; stage with explicit paths instead.

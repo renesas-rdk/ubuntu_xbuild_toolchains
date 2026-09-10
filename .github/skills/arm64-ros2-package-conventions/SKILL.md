@@ -20,20 +20,6 @@ description: Use this skill when an AI agent creates, edits, reviews, or organiz
 - Compile errors → `arm64-cross-build` decision tree.
 - On-device behavior → deploy/debug skills.
 
-## Workspace layout
-
-```
-src/
-├── apps/                    # demo entry points / bringup packages
-├── model_zoo/               # ML model packages (rzv_*)
-├── robots/                  # robot-specific descriptions, drivers, control
-└── utils/                   # shared utilities (e.g. fluentbit_ros_bridge)
-```
-
-Place new packages under the directory that matches their concern.
-When in doubt, look at sibling packages — naming conventions in this
-workspace are consistent and infectious.
-
 ## Build types
 
 | Code            | `<build_type>` in `package.xml` | Layout           |
@@ -86,15 +72,6 @@ When implementing a hardware interface:
 - Keep the plugin XML and the YAML controller config in the
   `*_ros2_control` package; never in `*_description`.
 
-## package.xml hygiene
-
-- Every runtime dep that triggers `find_package(...)` must appear as
-  `<depend>` (not `<build_depend>` only).
-- For Python packages, declare deps with `<exec_depend>` for libraries
-  imported at runtime.
-- Custom apt deps that aren't on rosdistro: add a local rosdep yaml
-  and reference it; don't tell users to `apt install` manually.
-
 ## Anti-patterns
 
 - Putting URDF and `ros2_control` plugin code in the same package.
@@ -140,6 +117,13 @@ Dependencies are resolved twice in this workspace:
 
 Guidance:
 
+- Every runtime dep that triggers `find_package(...)` must appear as
+  `<depend>` (not `<build_depend>` only).
+- For Python packages, declare deps with `<exec_depend>` for libraries
+  imported at runtime.
+- Board-specific deps carry `condition="$PRODUCT == 'V4H'"` or
+  `condition="$PRODUCT == 'V2H'"` on the dependency tag; those are the
+  only two forms used in this tree.
 - Use the **canonical rosdep key** (e.g. `libopencv-dev`,
   `boost`) — not a Debian-only package name. Check
   <https://github.com/ros/rosdistro/blob/master/rosdep/base.yaml>
