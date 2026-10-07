@@ -12,37 +12,69 @@
 #        as `ros-jazzy-*` debs, queried over SSH.
 #        This is what the binaries actually run against at runtime.
 #
-#   "Community" packages are every dependency declared in src/*/package.xml
-#   (third-party deps installed as debs), EXCLUDING the workspace's own packages
-#   (which are built from source). The check expands those direct dependencies
-#   through each environment's installed Debian Depends/Pre-Depends graph. This
-#   catches ABI providers that are only transitive dependencies.
+#   Two families of packages are checked:
 #
-#   Every direct dependency must be installed on both sides, and every package
-#   present in both transitive closures must have the exact same Debian version.
-#   A transitive package used only by one environment is reported as not
-#   comparable; it is often a legitimate alternative/runtime-only dependency.
-#   On confirmation, the script refreshes APT metadata, selects the newest exact
-#   version available to BOTH environments, and installs that exact
-#   package=version on each side. It never independently upgrades each side to a
-#   moving "latest" candidate.
+#     a) "Community" packages - every dependency declared in src/*/package.xml
+#        (third-party deps installed as debs), EXCLUDING the workspace's own
+#        packages (which are built from source).
+#     b) Vendor packages - everything published by the extra APT repositories
+#        (default https://apt.uxpai.dev), i.e. the board support packages that
+#        are not referenced from any package.xml but are still linked against
+#        or loaded at runtime (libcamera/libpvr/librcar-xos, kernel images...).
+#        Their names are read from each environment's own APT index, so the
+#        list follows the repository instead of being hardcoded here.
+#
+#   The check expands both families through each environment's installed Debian
+#   Depends/Pre-Depends graph. This catches ABI providers that are only
+#   transitive dependencies.
+#
+#   Only packages installed on BOTH sides are version-checked, and those must
+#   match exactly. A package installed on one side only is reported but is NOT
+#   an error, because the two environments are deliberately not identical:
+#
+#     * the sysroot carries build-time packages the board never needs
+#       (-dev, -dbg, headers, static libs);
+#     * the board carries runtime-only packages the sysroot never needs
+#       (kernel images, firmware, services).
+#
+#   Such packages are also kept out of the update set, so the script never
+#   pushes a -dev package onto the board. Pass --require-both to treat a
+#   one-sided install as an error instead (and to let the sync install it).
+#   On a first confirmation, the script refreshes APT metadata and selects the
+#   newest exact version available to BOTH environments. It then prints the
+#   plan (current -> target on each side), refuses any downgrade unless
+#   --allow-downgrades is given, and dry-runs the install on both sides. Only
+#   after a second confirmation does it install that exact package=version on
+#   each side. It never independently upgrades each side to a moving "latest"
+#   candidate.
 #
 # Usage:
 #   check_package_versions.py IP USER PASSWORD SYSROOT [SRC_DIR] [--check-only] [--yes]
 #
-#   --check-only  Report only; never modify either side (always safe / read-only).
-#   --yes         Skip the interactive [y/N] gate and apply updates directly.
+#   --check-only   Report only; never modify either side (always safe / read-only).
+#   --yes          Skip both interactive [y/N] gates and apply updates directly.
+#   --allow-downgrades  Accept a plan that downgrades a package on either side.
+#   --repo-uri U   Extra APT repository to pull package names from (repeatable).
+#                  Defaults to https://apt.uxpai.dev.
+#   --no-repo-check  Skip the extra-repository check entirely.
+#   --require-both Treat a package installed on one side only as an error, and
+#                  let the sync install it on the side that lacks it.
 #
 # Notes:
 #   * All sysroot reads are batched into a single `arm64-chroot` call because the
-#     wrapper holds a global lock and runs under QEMU emulation.
+#     wrapper holds a global lock and runs under QEMU emulation. The sysroot APT
+#     index files are the exception: the sysroot is a plain directory on the
+#     host, so they are read directly (no QEMU, no lock).
 #   * The target board is shared lab hardware: reads are always safe, but writes
 #     (apt upgrades) only ever happen after an explicit confirmation.
 # -----------------------------------------------------------------------------
 
 import argparse
+import bz2
 from functools import cmp_to_key
 import glob
+import gzip
+import lzma
 import os
 import re
 import shlex
@@ -85,6 +117,37 @@ SYSTEM_KEY_MAP = {
     "yaml-cpp": ["libyaml-cpp-dev"],
     "yaml_cpp": ["libyaml-cpp-dev"],
 }
+
+# Extra (vendor) APT repositories whose ENTIRE published package set must stay
+# consistent between the sysroot and the board, regardless of whether any
+# package.xml mentions them. These hold the board support packages
+# (libcamera/libpvr/librcar-xos, kernel images, ...) that the workspace links
+# against or loads at runtime.
+DEFAULT_REPO_URIS = ("https://apt.uxpai.dev",)
+
+# apt stores each downloaded index under <root>/var/lib/apt/lists/ using a file
+# name derived from the source URI: the scheme is dropped and every "/" becomes
+# "_". A repository's binary indexes therefore always start with its host name
+# and end with "_Packages" plus an optional compression suffix.
+APT_LISTS_DIR = "var/lib/apt/lists"
+APT_INDEX_SUFFIXES = ("", ".gz", ".xz", ".bz2", ".lz4", ".zst")
+
+# `arm64-chroot` runs its command through `sudo chroot`, which resets the
+# environment, so ROS_DISTRO never reaches rosdep inside the sysroot. Pass the
+# distribution explicitly instead.
+ROS_DISTRO = os.environ.get("ROS_DISTRO") or "jazzy"
+
+# Printed by `arm64-chroot` when another instance holds its (non-blocking) lock.
+CHROOT_BUSY_MARKER = "Another arm64-chroot instance is running"
+
+# Keep the locally modified version of any conffile without prompting. dpkg's
+# conffile prompt ignores DEBIAN_FRONTEND and would otherwise fail with
+# "EOF on stdin at conffile prompt", leaving a half-configured package behind.
+APT_INSTALL_OPTS = (
+    "-y", "--no-remove",
+    "-o", "Dpkg::Options::=--force-confdef",
+    "-o", "Dpkg::Options::=--force-confold",
+)
 
 _USE_COLOR = sys.stdout.isatty()
 
@@ -194,14 +257,28 @@ def _parse_dump(text):
     return packages
 
 
-def sysroot_dump(sysroot):
-    """Query all installed packages inside the sysroot via a single chroot call."""
+def _chroot(sysroot, snippet):
+    """Run ``bash -c snippet`` inside the sysroot and capture its output.
+
+    `arm64-chroot` does not wait for its global lock: when another instance
+    (typically a build) holds it, it exits at once. Report that explicitly
+    instead of letting callers misread the empty output.
+    """
     env = dict(os.environ, ARM64_SYSROOT=sysroot)
-    snippet = f"dpkg-query -W -f={shlex.quote(DPKG_QUERY_FORMAT)}"
     res = subprocess.run(
         ["arm64-chroot", "bash", "-c", snippet],
         capture_output=True, text=True, env=env,
     )
+    if res.returncode != 0 and CHROOT_BUSY_MARKER in res.stdout:
+        die("Another arm64-chroot instance is holding the sysroot lock "
+            "(a build or another sysroot task?). Wait for it and retry.")
+    return res
+
+
+def sysroot_dump(sysroot):
+    """Query all installed packages inside the sysroot via a single chroot call."""
+    snippet = f"dpkg-query -W -f={shlex.quote(DPKG_QUERY_FORMAT)}"
+    res = _chroot(sysroot, snippet)
     packages = _parse_dump(res.stdout)
     if not packages:
         die("Could not read any package versions from the sysroot via "
@@ -246,6 +323,203 @@ def board_dump(ip, user, password):
 
 
 # -----------------------------------------------------------------------------
+# 2b. Enumerate every package published by the extra APT repositories
+# -----------------------------------------------------------------------------
+def repo_host(uri):
+    """Host part of a repository URI ("https://apt.uxpai.dev/x" -> "apt.uxpai.dev")."""
+    return uri.split("://", 1)[-1].split("/", 1)[0].strip()
+
+
+def _is_packages_index(path):
+    """True for an apt binary index file (optionally compressed)."""
+    base = os.path.basename(path)
+    return any(base.endswith("_Packages" + suffix) for suffix in APT_INDEX_SUFFIXES)
+
+
+def _parse_packages_index(text):
+    """Return {package: {version, ...}} from the text of a Debian Packages index.
+
+    Continuation lines in a Packages stanza are indented, so a line starting at
+    column 0 with a known field name is always that stanza's own field.
+    """
+    available, name = {}, None
+    for line in text.splitlines():
+        if line.startswith("Package: "):
+            name = line[len("Package: "):].strip()
+        elif line.startswith("Version: ") and name:
+            available.setdefault(name, set()).add(line[len("Version: "):].strip())
+        elif not line.strip():
+            name = None
+    return available
+
+
+_INDEX_OPENERS = {"": open, ".gz": gzip.open, ".xz": lzma.open, ".bz2": bz2.open}
+
+
+def _read_index_file(path):
+    """Read one apt index file, transparently decompressing known suffixes.
+
+    apt can be told to keep its lists in a codec Python has no module for
+    (``.lz4`` in particular), so an unknown suffix is handed to the matching
+    command line tool instead of being parsed as text.
+    """
+    suffix = os.path.splitext(path)[1]
+    opener = _INDEX_OPENERS.get(suffix)
+    if opener is None:
+        tool = {".lz4": "lz4", ".zst": "zstd"}.get(suffix)
+        if tool is None:
+            warn(f"Unsupported APT index compression for {path}; skipped.")
+            return ""
+        try:
+            res = subprocess.run([tool, "-cd", path],
+                                 capture_output=True, text=True)
+        except FileNotFoundError:
+            warn(f"`{tool}` not found on PATH; cannot read APT index {path}.")
+            return ""
+        if res.returncode != 0:
+            warn(f"Could not decompress APT index {path}: {res.stderr.strip()}")
+            return ""
+        return res.stdout
+    try:
+        with opener(path, "rt", errors="replace") as handle:
+            return handle.read()
+    except (OSError, EOFError, lzma.LZMAError) as exc:
+        warn(f"Could not read APT index {path}: {exc}")
+        return ""
+
+
+def _uncommented(text):
+    """Drop comment lines so a commented-out source is not read as configured."""
+    return "\n".join(line for line in text.splitlines()
+                      if not line.lstrip().startswith("#"))
+
+
+def sysroot_repo_index(sysroot, hosts):
+    """Packages published by ``hosts``, read from the sysroot's APT cache.
+
+    The sysroot is an ordinary directory on the host, so its index and sources
+    files are read directly rather than through `arm64-chroot`: no QEMU, no
+    global lock. Returns ({package: {version, ...}}, {configured host, ...}).
+    """
+    available, configured = {}, set()
+    if not hosts:
+        return available, configured
+
+    sources = ""
+    source_files = [os.path.join(sysroot, "etc/apt/sources.list")]
+    source_files += sorted(glob.glob(
+        os.path.join(sysroot, "etc/apt/sources.list.d", "*")))
+    for path in source_files:
+        try:
+            with open(path, "r", errors="replace") as handle:
+                sources += _uncommented(handle.read()) + "\n"
+        except OSError:
+            continue
+
+    lists_dir = os.path.join(sysroot, APT_LISTS_DIR)
+    for host in hosts:
+        if host in sources:
+            configured.add(host)
+        for path in sorted(glob.glob(os.path.join(lists_dir, host + "_*"))):
+            if not _is_packages_index(path):
+                continue
+            for name, versions in _parse_packages_index(
+                    _read_index_file(path)).items():
+                available.setdefault(name, set()).update(versions)
+    return available, configured
+
+
+def _board_repo_snippet(hosts):
+    """Shell snippet that dumps the board's index for each host, marker-tagged."""
+    parts = []
+    for host in hosts:
+        quoted = shlex.quote(host)
+        parts.append(
+            f"if grep -rhs -- {quoted} /etc/apt/sources.list "
+            f"/etc/apt/sources.list.d/ 2>/dev/null "
+            f"| grep -qvE '^[[:space:]]*#'; then "
+            f"printf 'REPO_CONFIGURED\\t%s\\n' {quoted}; fi"
+        )
+        parts.append(
+            f"for f in /var/lib/apt/lists/{host}_*; do "
+            f"[ -f \"$f\" ] || continue; "
+            f"case \"$f\" in "
+            f"*_Packages) cat \"$f\" ;; "
+            f"*_Packages.gz) gzip -cd \"$f\" ;; "
+            f"*_Packages.xz) xz -cd \"$f\" ;; "
+            f"*_Packages.bz2) bzip2 -cd \"$f\" ;; "
+            f"*_Packages.lz4) lz4 -cd \"$f\" ;; "
+            f"*_Packages.zst) zstd -cd \"$f\" ;; "
+            f"*) continue ;; "
+            f"esac; done 2>/dev/null "
+            f"| awk '/^Package: /{{p=$2}} "
+            f"/^Version: /{{if (p != \"\") print \"REPO_PKG\\t\" p \"\\t\" $2}}'"
+        )
+    return "; ".join(parts)
+
+
+def board_repo_index(ip, user, password, hosts):
+    """Same information as :func:`sysroot_repo_index`, read from the board."""
+    available, configured = {}, set()
+    if not hosts:
+        return available, configured
+    res = _ssh(ip, user, password, _board_repo_snippet(hosts))
+    if res is None or res.returncode != 0:
+        warn("Could not read the extra APT repository index from the board.\n"
+             f"{res.stderr.strip() if res else ''}")
+        return available, configured
+    for line in res.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) == 2 and fields[0] == "REPO_CONFIGURED":
+            configured.add(fields[1].strip())
+        elif len(fields) == 3 and fields[0] == "REPO_PKG":
+            name, version = fields[1].strip(), fields[2].strip()
+            if name and version:
+                available.setdefault(name, set()).add(version)
+    return available, configured
+
+
+def collect_repo_packages(sysroot, ip, user, password, hosts,
+                          sysroot_packages, board_packages):
+    """Union of the package names the repositories publish to either side.
+
+    Each side is asked separately: a repository may legitimately be pinned to a
+    different snapshot on the board, and a package that only one side knows
+    about is exactly the kind of drift this check exists to surface. Returns
+    (published names, names installed on at least one side).
+    """
+    sysroot_available, sysroot_configured = sysroot_repo_index(sysroot, hosts)
+    board_available, board_configured = board_repo_index(ip, user, password, hosts)
+
+    for host in hosts:
+        if host not in sysroot_configured:
+            warn(f"{host} is not an enabled APT source in the sysroot.")
+        if host not in board_configured:
+            warn(f"{host} is not an enabled APT source on the board.")
+
+    published = set(sysroot_available) | set(board_available)
+    if not published:
+        warn("No APT index found for " + ", ".join(hosts) +
+             "; run `apt-get update` on both sides so their package lists can "
+             "be compared (use --no-repo-check to skip this check).")
+        return published, set()
+
+    installed = {name for name in published
+                 if name in sysroot_packages or name in board_packages}
+    only_sysroot = sorted(set(sysroot_available) - set(board_available))
+    only_board = sorted(set(board_available) - set(sysroot_available))
+    info(f"{', '.join(hosts)}: {len(published)} published package(s), "
+         f"{len(installed)} installed on at least one side.")
+    if only_sysroot:
+        warn("Published to the sysroot only (repository snapshots differ): "
+             + ", ".join(only_sysroot))
+    if only_board:
+        warn("Published to the board only (repository snapshots differ): "
+             + ", ".join(only_board))
+    return published, installed
+
+
+# -----------------------------------------------------------------------------
 # 3. Map a package.xml dependency name to its apt package name
 # -----------------------------------------------------------------------------
 def candidate_apt_names(key):
@@ -273,33 +547,49 @@ def rosdep_resolve(keys, sysroot):
     """Best-effort fallback: resolve keys via rosdep inside the sysroot.
 
     Only invoked for keys that the cheap transform could not place. Uses a
-    labelled loop so each key's output is unambiguous. Returns {key: [apt,...]}.
+    labelled loop so each key's output is unambiguous; a failing key's error
+    text is tagged so it is reported instead of being read as package names.
+    Only names under rosdep's ``#apt`` installer are accepted (``#pip`` and
+    ``#source`` rules do not name Debian packages). Returns {key: [apt,...]}.
     """
     if not keys:
         return {}
-    env = dict(os.environ, ARM64_SYSROOT=sysroot)
     key_list = " ".join(shlex.quote(k) for k in keys)
+    distro = shlex.quote(ROS_DISTRO)
     snippet = (
         f'for k in {key_list}; do '
         f'echo "ROSDEP_KEY=$k"; '
-        f'rosdep resolve "$k" 2>/dev/null || true; '
+        f'if out=$(rosdep resolve --rosdistro={distro} "$k" 2>&1); then '
+        f'printf "%s\\n" "$out"; '
+        f'else printf "%s\\n" "$out" | sed "s/^/ROSDEP_ERR=/"; fi; '
         f'echo "ROSDEP_END=$k"; '
         f'done'
     )
-    res = subprocess.run(
-        ["arm64-chroot", "bash", "-c", snippet],
-        capture_output=True, text=True, env=env,
-    )
-    mapping, current = {}, None
+    res = _chroot(sysroot, snippet)
+    mapping, errors, current, installer = {}, {}, None, None
     for line in res.stdout.splitlines():
         line = line.strip()
         if line.startswith("ROSDEP_KEY="):
-            current = line[len("ROSDEP_KEY="):]
+            current, installer = line[len("ROSDEP_KEY="):], None
             mapping[current] = []
         elif line.startswith("ROSDEP_END="):
             current = None
-        elif current and line and not line.startswith("#"):
+        elif not current or not line:
+            continue
+        elif line.startswith("ROSDEP_ERR="):
+            errors.setdefault(current, line[len("ROSDEP_ERR="):].strip())
+        elif line.startswith("#ROSDEP["):
+            continue
+        elif line.startswith("#"):
+            installer = line[1:].strip()
+        elif installer == "apt":
             mapping[current].extend(line.split())
+
+    if not mapping:
+        warn("rosdep could not be run inside the sysroot; unmapped keys stay "
+             f"unresolved.\n{(res.stderr or res.stdout).strip()}")
+    for key, message in sorted(errors.items()):
+        warn(f"rosdep resolve {key}: {message}")
     return {k: v for k, v in mapping.items() if v}
 
 
@@ -408,12 +698,15 @@ def dependency_closure(seeds, packages):
     return closure
 
 
-def build_report(scope, required_both, sysroot_packages, board_packages):
+def build_report(scope, tracked, sysroot_packages, board_packages):
     """Compare versions in ``scope`` and enforce direct dependencies.
 
-    ``required_both`` contains direct package.xml dependency seeds. A one-sided
-    transitive package is not automatically an ABI problem because Debian
-    alternatives and environment-specific runtime helpers are valid.
+    ``tracked`` holds the direct seeds (package.xml dependencies and vendor
+    repository packages). A one-sided install is collected into ``missing`` for
+    those seeds and into ``absent`` for anything reached only transitively; the
+    caller decides whether ``missing`` is an error (see --require-both). A
+    one-sided package is not automatically an ABI problem: Debian alternatives,
+    build-only -dev packages and environment-specific runtime helpers are valid.
     """
     matched, mismatches, missing, absent = [], [], [], []
     for apt in sorted(scope):
@@ -432,7 +725,7 @@ def build_report(scope, required_both, sysroot_packages, board_packages):
                     "board": bv,
                     "outdated": "sysroot" if cmp < 0 else "board",
                 })
-        elif (sv or bv) and apt in required_both:
+        elif (sv or bv) and apt in tracked:
             missing.append({
                 "apt": apt,
                 "sysroot": sv,
@@ -444,10 +737,73 @@ def build_report(scope, required_both, sysroot_packages, board_packages):
     return matched, mismatches, missing, absent
 
 
+def repo_status_rows(published, sysroot_packages, board_packages):
+    """Per-package status of everything the extra repositories publish."""
+    rows = []
+    for apt in sorted(published):
+        sysroot_record = sysroot_packages.get(apt)
+        board_record = board_packages.get(apt)
+        sv = sysroot_record["version"] if sysroot_record else None
+        bv = board_record["version"] if board_record else None
+        if sv and bv:
+            status = "IN SYNC" if deb_compare(sv, bv) == 0 else "MISMATCH"
+        elif sv:
+            status = "SYSROOT ONLY"
+        elif bv:
+            status = "BOARD ONLY"
+        else:
+            status = "NOT INSTALLED"
+        rows.append({"apt": apt, "sysroot": sv, "board": bv, "status": status})
+    return rows
+
+
 # -----------------------------------------------------------------------------
 # 5. Reporting
 # -----------------------------------------------------------------------------
-def print_report(matched, mismatches, missing, absent, unresolved):
+_REPO_STATUS_COLOR = {
+    "IN SYNC": "0;32",
+    "MISMATCH": "1;33",
+    "SYSROOT ONLY": "1;33",
+    "BOARD ONLY": "1;33",
+}
+
+
+def print_repo_report(rows, hosts, strict):
+    """Print the status of every package published by the extra repositories."""
+    step("Extra APT repository packages (" + ", ".join(hosts) + ")")
+
+    installed = [row for row in rows if row["status"] != "NOT INSTALLED"]
+    if installed:
+        name_w = max([len(r["apt"]) for r in installed] + [len("PACKAGE")])
+        sv_w = max([len(r["sysroot"] or "-") for r in installed] + [len("SYSROOT")])
+        bv_w = max([len(r["board"] or "-") for r in installed] + [len("BOARD")])
+        st_w = max(len(r["status"]) for r in installed)
+        print()
+        print("    " + _c("1", f"{'PACKAGE':<{name_w}}  {'SYSROOT':<{sv_w}}  "
+                                f"{'BOARD':<{bv_w}}  STATUS"))
+        print("    " + "  ".join(["-" * name_w, "-" * sv_w, "-" * bv_w, "-" * st_w]))
+        for row in installed:
+            colour = _REPO_STATUS_COLOR.get(row["status"], "0")
+            print(f"    {row['apt']:<{name_w}}  {(row['sysroot'] or '-'):<{sv_w}}  "
+                  f"{(row['board'] or '-'):<{bv_w}}  {_c(colour, row['status'])}")
+        print()
+
+    one_sided = [r for r in installed if r["status"].endswith("ONLY")]
+    if one_sided and not strict:
+        info(f"{len(one_sided)} vendor package(s) are installed on one side only; "
+             "not treated as errors (pass --require-both to require both sides).")
+
+    not_installed = [row["apt"] for row in rows if row["status"] == "NOT INSTALLED"]
+    if not_installed:
+        info(f"{len(not_installed)} published package(s) are installed on neither "
+             "side: " + ", ".join(not_installed))
+
+    if installed and not any(r["status"] != "IN SYNC" for r in installed):
+        ok("Every installed vendor repository package is at the same version on "
+           "both sides.")
+
+
+def print_report(matched, mismatches, missing, absent, unresolved, strict):
     step("Version comparison")
 
     if mismatches:
@@ -466,14 +822,20 @@ def print_report(matched, mismatches, missing, absent, unresolved):
             print(f"    {m['apt']:<{name_w}}  {m['sysroot']:<{sv_w}}  "
                   f"{m['board']:<{bv_w}}  {_c('1;33', verdict)}")
         print()
-    elif not missing:
+    elif not (missing and strict):
         ok("No version mismatches between the sysroot and the board.")
 
     if missing:
         name_w = max([len(m["apt"]) for m in missing] + [len("PACKAGE")])
         sv_w = max([len(m["sysroot"] or "-") for m in missing] + [len("SYSROOT")])
         bv_w = max([len(m["board"] or "-") for m in missing] + [len("BOARD")])
-        warn(f"{len(missing)} required package(s) are installed on one side only:")
+        if strict:
+            warn(f"{len(missing)} required package(s) are installed on one side "
+                 "only (--require-both):")
+        else:
+            info(f"{len(missing)} dependency package(s) are installed on one "
+                 "side only; not an error, and not part of any update:")
+        verdict_colour = "1;33" if strict else "0;34"
         print()
         print("    " + _c("1", f"{'PACKAGE':<{name_w}}  {'SYSROOT':<{sv_w}}  "
                                 f"{'BOARD':<{bv_w}}  VERDICT"))
@@ -482,8 +844,14 @@ def print_report(matched, mismatches, missing, absent, unresolved):
             bv = item["board"] or "-"
             verdict = f"MISSING FROM {item['missing_from'].upper()}"
             print(f"    {item['apt']:<{name_w}}  {sv:<{sv_w}}  {bv:<{bv_w}}  "
-                  f"{_c('1;33', verdict)}")
+                  f"{_c(verdict_colour, verdict)}")
         print()
+        if not strict:
+            print("    The sysroot carries build-time packages the board never "
+                  "needs (-dev,\n    headers) and the board carries runtime-only "
+                  "packages the sysroot never\n    needs (kernel, firmware). Pass "
+                  "--require-both to treat these as errors.")
+            print()
 
     if unresolved:
         warn(f"Could not map {len(unresolved)} package.xml dependency key(s); "
@@ -495,7 +863,10 @@ def print_report(matched, mismatches, missing, absent, unresolved):
     step("Summary")
     print(f"  {_c('0;32', 'in sync')}        : {len(matched)}")
     print(f"  {_c('1;33', 'mismatched')}     : {len(mismatches)}")
-    print(f"  {_c('1;33', 'one side only')}  : {len(missing)}")
+    one_sided = _c("1;33", "one side only") if strict or not missing \
+        else _c("0;34", "one side only")
+    suffix = "" if strict or not missing else "  (ignored)"
+    print(f"  {one_sided}  : {len(missing)}{suffix}")
     print(f"  not comparable : {not_comparable}")
 
 
@@ -542,13 +913,8 @@ def _parse_madison(text, names):
 
 
 def sysroot_available_versions(sysroot, names):
-    env = dict(os.environ, ARM64_SYSROOT=sysroot)
     joined = " ".join(shlex.quote(name) for name in names)
-    snippet = f"apt-cache madison {joined}"
-    res = subprocess.run(
-        ["arm64-chroot", "bash", "-c", snippet],
-        capture_output=True, text=True, env=env,
-    )
+    res = _chroot(sysroot, f"apt-cache madison {joined}")
     if res.returncode != 0:
         die(f"Could not query sysroot APT versions:\n{res.stderr.strip()}")
     return _parse_madison(res.stdout, names)
@@ -587,16 +953,107 @@ def select_common_versions(names, sysroot_packages, board_packages,
     return targets, unavailable
 
 
-def install_sysroot_exact(sysroot, targets, installed):
-    specs = [f"{name}={version}" for name, version in sorted(targets.items())
-             if name not in installed or installed[name]["version"] != version]
+def install_specs(targets, installed):
+    """``name=version`` specs for the targets not already installed as such."""
+    return [f"{name}={version}" for name, version in sorted(targets.items())
+            if name not in installed or installed[name]["version"] != version]
+
+
+def _apt_install_cmd(specs, allow_downgrades, simulate=False):
+    """Shell-quoted `apt-get install` command line for exact-version specs."""
+    argv = ["apt-get", "install", *APT_INSTALL_OPTS]
+    if simulate:
+        argv.append("--simulate")
+    if allow_downgrades:
+        argv.append("--allow-downgrades")
+    return " ".join(shlex.quote(arg) for arg in argv + list(specs))
+
+
+def plan_rows(targets, sysroot_packages, board_packages):
+    """Per-package current -> target versions on each side, with downgrades."""
+    rows = []
+    for name, target in sorted(targets.items()):
+        row = {"apt": name, "target": target, "downgrade": []}
+        for side, packages in (("sysroot", sysroot_packages),
+                               ("board", board_packages)):
+            record = packages.get(name)
+            current = record["version"] if record else None
+            row[side] = current
+            if current and deb_compare(target, current) < 0:
+                row["downgrade"].append(side)
+        rows.append(row)
+    return rows
+
+
+def print_plan(rows, repo_published, label):
+    """Print exactly what each side will be moved to, before any install."""
+    def cell(current, target):
+        if current == target:
+            return f"{current} (unchanged)"
+        return f"{current or '(not installed)'} -> {target}"
+
+    cells = [(r["apt"], cell(r["sysroot"], r["target"]),
+              cell(r["board"], r["target"])) for r in rows]
+    name_w = max([len(c[0]) for c in cells] + [len("PACKAGE")])
+    sv_w = max([len(c[1]) for c in cells] + [len("SYSROOT")])
+    bv_w = max([len(c[2]) for c in cells] + [len("BOARD")])
+    print()
+    print("    " + _c("1", f"{'PACKAGE':<{name_w}}  {'SYSROOT':<{sv_w}}  "
+                            f"{'BOARD':<{bv_w}}  NOTE"))
+    for row, (name, sysroot_cell, board_cell) in zip(rows, cells):
+        notes = []
+        if row["downgrade"]:
+            notes.append(_c("0;31", "DOWNGRADE " + "+".join(
+                side.upper() for side in row["downgrade"])))
+        if name in repo_published:
+            notes.append(_c("1;35", label))
+        print(f"    {name:<{name_w}}  {sysroot_cell:<{sv_w}}  "
+              f"{board_cell:<{bv_w}}  {' '.join(notes)}")
+    print()
+
+
+_SIMULATED_INST = re.compile(r"^Inst (\S+)(?: \[([^\]]+)\])? \((\S+)")
+
+
+def _parse_simulation(text):
+    """{package: (old version or None, new version)} from `apt-get -s` output."""
+    changes = {}
+    for line in text.splitlines():
+        match = _SIMULATED_INST.match(line.strip())
+        if match:
+            changes[match.group(1)] = (match.group(2), match.group(3))
+    return changes
+
+
+def simulate_sysroot(sysroot, specs, allow_downgrades):
+    """Dry-run the sysroot install. Returns (ok, {package: (old, new)}, output)."""
+    if not specs:
+        return True, {}, ""
+    res = _chroot(sysroot, _apt_install_cmd(specs, allow_downgrades,
+                                            simulate=True))
+    output = res.stdout + res.stderr
+    return res.returncode == 0, _parse_simulation(res.stdout), output
+
+
+def simulate_board(ip, user, password, specs, allow_downgrades):
+    """Dry-run the board install (no sudo: a simulation needs no root)."""
+    if not specs:
+        return True, {}, ""
+    res = _ssh(ip, user, password,
+               _apt_install_cmd(specs, allow_downgrades, simulate=True))
+    if res is None:
+        return False, {}, ""
+    output = res.stdout + res.stderr
+    return res.returncode == 0, _parse_simulation(res.stdout), output
+
+
+def install_sysroot_exact(sysroot, specs, allow_downgrades):
     if not specs:
         ok("Sysroot already has every selected exact version.")
         return True
     env = dict(os.environ, ARM64_SYSROOT=sysroot)
-    joined = " ".join(shlex.quote(spec) for spec in specs)
-    snippet = ("DEBIAN_FRONTEND=noninteractive apt-get install -y "
-               f"--allow-downgrades --no-remove {joined}")
+    snippet = ("DEBIAN_FRONTEND=noninteractive "
+               + _apt_install_cmd(specs, allow_downgrades))
     info("Sysroot command: arm64-chroot apt-get install "
          + " ".join(specs))
     res = subprocess.run(["arm64-chroot", "bash", "-c", snippet], env=env)
@@ -623,16 +1080,13 @@ def fix_sysroot(sysroot):
     return res.returncode == 0
 
 
-def install_board_exact(ip, user, password, targets, installed):
-    specs = [f"{name}={version}" for name, version in sorted(targets.items())
-             if name not in installed or installed[name]["version"] != version]
+def install_board_exact(ip, user, password, specs, allow_downgrades):
     if not specs:
         ok("Board already has every selected exact version.")
         return True
     q = shlex.quote(password)
-    joined = " ".join(shlex.quote(spec) for spec in specs)
     remote = (f"echo {q} | sudo -S -p '' env DEBIAN_FRONTEND=noninteractive "
-              f"apt-get install -y --allow-downgrades --no-remove {joined}")
+              + _apt_install_cmd(specs, allow_downgrades))
     info(f"Board command: ssh {user}@{ip} "
          f"'<sudo apt-get install {' '.join(specs)}>'")
     res = subprocess.run(
@@ -657,11 +1111,39 @@ def main():
                     help="Report only; never modify either side.")
     ap.add_argument("--yes", action="store_true",
                     help="Apply updates without the interactive [y/N] gate.")
+    ap.add_argument("--repo-uri", action="append", metavar="URI",
+                    help="Extra APT repository whose entire published package "
+                         "set is checked, on top of the package.xml "
+                         "dependencies. Repeatable. Defaults to "
+                         + ", ".join(DEFAULT_REPO_URIS) + ".")
+    ap.add_argument("--no-repo-check", action="store_true",
+                    help="Skip the extra APT repository check.")
+    ap.add_argument("--require-both", action="store_true",
+                    help="Treat a package installed on one side only as an "
+                         "error and let the sync install it on the side that "
+                         "lacks it. Off by default: the sysroot legitimately "
+                         "carries build-only packages (-dev, headers) and the "
+                         "board legitimately carries runtime-only ones "
+                         "(kernel, firmware).")
+    ap.add_argument("--allow-downgrades", action="store_true",
+                    help="Allow the sync to downgrade a package on either "
+                         "side. Off by default: a plan that needs a downgrade "
+                         "is shown and refused.")
     ap.add_argument("--rosdep", action="store_true",
                     help="Deprecated compatibility option; unresolved keys are "
                          "now always passed through rosdep so the ABI check cannot "
                          "silently omit abstract system dependencies.")
     args = ap.parse_args()
+
+    repo_uris = () if args.no_repo_check else tuple(
+        args.repo_uri or DEFAULT_REPO_URIS)
+    repo_hosts = []
+    for uri in repo_uris:
+        host = repo_host(uri)
+        if not host:
+            die(f"Cannot derive a host name from repository URI {uri!r}.")
+        if host not in repo_hosts:
+            repo_hosts.append(host)
 
     sysroot = args.sysroot
     if not sysroot or sysroot.startswith("${"):
@@ -696,19 +1178,44 @@ def main():
     resolved, unresolved = resolve_dependencies(
         community, sysroot_packages, board_packages, sysroot
     )
-    seeds = set().union(*resolved.values()) if resolved else set()
+    direct = set().union(*resolved.values()) if resolved else set()
+
+    repo_published, repo_installed = set(), set()
+    if repo_hosts:
+        step("Enumerating extra APT repository packages")
+        repo_published, repo_installed = collect_repo_packages(
+            sysroot, args.ip, args.user, args.password, repo_hosts,
+            sysroot_packages, board_packages,
+        )
+
+    # Vendor packages are seeds like any direct dependency, so their own
+    # Depends/Pre-Depends are compared too. Every seed is tracked so a one-sided
+    # install stays visible in the report; --require-both decides whether that
+    # is an error.
+    seeds = direct | repo_installed
     sysroot_closure = dependency_closure(seeds, sysroot_packages)
     board_closure = dependency_closure(seeds, board_packages)
     scope = seeds | sysroot_closure | board_closure
-    info(f"Dependency scope: {len(seeds)} direct Debian package(s), "
+    info(f"Dependency scope: {len(direct)} direct package.xml Debian "
+         f"package(s), {len(repo_installed)} vendor repository package(s), "
          f"{len(scope)} package(s) including transitive Depends/Pre-Depends.")
 
     matched, mismatches, missing, absent = build_report(
         scope, seeds, sysroot_packages, board_packages
     )
-    print_report(matched, mismatches, missing, absent, unresolved)
+    if repo_published:
+        print_repo_report(
+            repo_status_rows(repo_published, sysroot_packages, board_packages),
+            repo_hosts, args.require_both,
+        )
+    print_report(matched, mismatches, missing, absent, unresolved,
+                 args.require_both)
 
-    drift = mismatches + missing
+    # Without --require-both a one-sided package is reported but never
+    # installed: pushing a -dev package onto the board (shared lab hardware)
+    # would be wrong, and so would installing the board's kernel into the
+    # sysroot.
+    drift = mismatches + (missing if args.require_both else [])
     if not drift:
         ok("All comparable direct and transitive dependency packages are "
            "installed at identical versions in the sysroot and on the board.")
@@ -721,16 +1228,21 @@ def main():
 
     update_pkgs = sorted({item["apt"] for item in drift})
 
-    step("Proposed updates")
-    warn(f"APT metadata will be refreshed on both environments. Then "
-         f"{len(update_pkgs)} inconsistent package(s) will be installed at the "
-         "newest EXACT version available to BOTH environments (board is "
-         "SHARED LAB HARDWARE):")
+    # Two gates: the first only allows the APT metadata refresh needed to
+    # build an exact-version plan; the second shows that plan (with every
+    # downgrade and every extra package apt would touch) before anything is
+    # installed.
+    step("Inconsistent packages")
+    warn(f"{len(update_pkgs)} inconsistent package(s) need an exact version "
+         "that is available to BOTH environments:")
+    label = "[" + ", ".join(repo_hosts) + "]" if repo_hosts else ""
     for package in update_pkgs:
-        print(f"    {package}")
+        suffix = f"  {_c('1;35', label)}" if package in repo_published else ""
+        print(f"    {package}{suffix}")
 
-    if not args.yes and not confirm(
-            _c("1;33", "\nApply these updates? [y/N] ")):
+    if not args.yes and not confirm(_c(
+            "1;33", "\nRefresh APT metadata on both environments to build an "
+                    "update plan? No package is installed yet. [y/N] ")):
         warn("Aborted by user. No changes made.")
         return 2
 
@@ -758,11 +1270,67 @@ def main():
                   f"board={sorted(board_versions)}", file=sys.stderr)
         err("Use the same RDK/ROS APT snapshot on both environments, then retry.")
         return 1
-    for package, version in sorted(targets.items()):
-        info(f"Selected {package}={version}")
+    step("Update plan")
+    rows = plan_rows(targets, sysroot_packages, board_packages)
+    print_plan(rows, repo_published, label)
+
+    downgrades = [r for r in rows if r["downgrade"]]
+    if downgrades and not args.allow_downgrades:
+        err(f"{len(downgrades)} package(s) would be DOWNGRADED; nothing was "
+            "installed. The newest version both environments can install is "
+            "older than what one side already has, usually because their APT "
+            "sources differ. Align the sources, or re-run with "
+            "--allow-downgrades to accept the plan above.")
+        return 1
+
+    vendor_updates = [r["apt"] for r in rows if r["apt"] in repo_published]
+    if vendor_updates:
+        warn(f"{len(vendor_updates)} of those come from the vendor repository "
+             "and may include kernel or firmware packages. Review the plan "
+             "before confirming: the board reboots into whatever kernel is "
+             "installed here.")
+
+    # Dry-run both sides before touching either, so a conflict on the board
+    # cannot leave the sysroot already modified.
+    step("Simulating the update on both environments")
+    sysroot_specs = install_specs(targets, sysroot_packages)
+    board_specs = install_specs(targets, board_packages)
+    simulations = (
+        ("sysroot", sysroot_specs,
+         simulate_sysroot(sysroot, sysroot_specs, args.allow_downgrades)),
+        ("board", board_specs,
+         simulate_board(args.ip, args.user, args.password, board_specs,
+                        args.allow_downgrades)),
+    )
+    failed = False
+    for side, specs, (sim_ok, changes, output) in simulations:
+        if not sim_ok:
+            failed = True
+            err(f"Simulated install failed on the {side}:")
+            tail = output.strip().splitlines()[-15:]
+            print("\n".join("    " + line for line in tail), file=sys.stderr)
+            continue
+        requested = {spec.split("=", 1)[0] for spec in specs}
+        extra = sorted(set(changes) - requested)
+        ok(f"{side}: {len(specs)} requested package(s) install cleanly.")
+        if extra:
+            warn(f"{side}: apt would also change {len(extra)} other "
+                 "package(s):")
+            for name in extra:
+                old, new = changes[name]
+                print(f"    {name}  {old or '(not installed)'} -> {new}")
+    if failed:
+        err("Nothing was installed on either environment.")
+        return 1
+
+    if not args.yes and not confirm(
+            _c("1;33", "\nApply exactly this plan? [y/N] ")):
+        warn("Aborted by user. APT metadata was refreshed; no package was "
+             "installed.")
+        return 2
 
     step("Updating sysroot")
-    if install_sysroot_exact(sysroot, targets, sysroot_packages):
+    if install_sysroot_exact(sysroot, sysroot_specs, args.allow_downgrades):
         step("Fixing sysroot (sysroot-fix)")
         if not fix_sysroot(sysroot):
             warn("sysroot-fix reported a failure; check CMake paths manually.")
@@ -772,7 +1340,8 @@ def main():
 
     step("Updating board")
     if not install_board_exact(
-            args.ip, args.user, args.password, targets, board_packages):
+            args.ip, args.user, args.password, board_specs,
+            args.allow_downgrades):
         err("Board update reported a failure.")
         return 1
 
@@ -785,8 +1354,14 @@ def main():
     matched2, mismatches2, missing2, absent2 = build_report(
         scope2, seeds, sysroot_packages2, board_packages2
     )
-    print_report(matched2, mismatches2, missing2, absent2, unresolved)
-    if mismatches2 or missing2:
+    if repo_published:
+        print_repo_report(
+            repo_status_rows(repo_published, sysroot_packages2, board_packages2),
+            repo_hosts, args.require_both,
+        )
+    print_report(matched2, mismatches2, missing2, absent2, unresolved,
+                 args.require_both)
+    if mismatches2 or (missing2 and args.require_both):
         warn("Dependency versions are still inconsistent after the update. "
              "No successful consistency result will be reported.")
         return 1

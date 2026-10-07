@@ -1,5 +1,18 @@
 # Change Log
 
+## [1.5.0] - 2026-10-07
+
+### Updated
+
+- `check_package_versions.py` now also checks vendor packages published by extra APT repositories (default `https://apt.uxpai.dev`).
+- New `check_package_versions.py` options: `--repo-uri` (add a repository, repeatable), `--no-repo-check`, `--require-both`, and `--allow-downgrades`.
+
+## [1.4.0] - 2026-09-10
+
+### Changed
+
+- Improved all workspace agent skills (`arm64-cross-build`, `arm64-deploy-debug`, `arm64-ros2-package-conventions`, `arm64-target-autonomous-test`, `git-commit`) after a review against Claude skill-authoring guidance.
+
 ## [1.3.0] - 2026-08-26
 
 ### Added
@@ -14,7 +27,7 @@
 
 ### Fixed
 
-- - A release that changes `entrypoint.sh` now takes effect on the start that installs it. Previously the running shell kept executing the *previous* release's script after the checkout, so the `/usr/local/bin` wrapper symlinks, template seeding, and workspace skill symlinks stayed one release behind — anything a release added there needed a second `docker restart` to appear. The entrypoint now re-execs the freshly checked-out copy of itself, passing the resolved tag in `TOOLCHAIN_REEXEC_RELEASE` so the update isn't resolved, fetched, or applied twice. It re-execs at most once per start, and only when `entrypoint.sh` actually changed.
+- A release that changes `entrypoint.sh` now takes effect on the start that installs it. Previously the running shell kept executing the *previous* release's script after the checkout, so the `/usr/local/bin` wrapper symlinks, template seeding, and workspace skill symlinks stayed one release behind — anything a release added there needed a second `docker restart` to appear. The entrypoint now re-execs the freshly checked-out copy of itself, passing the resolved tag in `TOOLCHAIN_REEXEC_RELEASE` so the update isn't resolved, fetched, or applied twice. It re-execs at most once per start, and only when `entrypoint.sh` actually changed.
 
 ## [1.2.0] - 2026-07-11
 
