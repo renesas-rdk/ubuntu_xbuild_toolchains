@@ -5,8 +5,12 @@
 # other UID -> re-map ubuntu to it). Done in one sudo that ends by dropping back
 # to ubuntu via setpriv and re-running this script, so `docker exec` still lands
 # as ubuntu (a usermod + second sudo would crash on the now-stale caller UID).
+# The re-run carries ENTRYPOINT_WS_RECONCILED=1 so this is tried only once: on a
+# shared-folder mount whose ownership can't change (e.g. colima virtiofs on
+# macOS, where every file shows as 0:0 and chown has no effect) re-checking
+# would re-exec forever.
 ROS2_WS_DIR="${ROS2_WS:-/home/ubuntu/ros2_ws}"
-if [ -d "$ROS2_WS_DIR" ]; then
+if [ -d "$ROS2_WS_DIR" ] && [ -z "${ENTRYPOINT_WS_RECONCILED:-}" ]; then
     ws_uid="$(stat -c %u "$ROS2_WS_DIR" 2>/dev/null || echo -1)"
     ws_gid="$(stat -c %g "$ROS2_WS_DIR" 2>/dev/null || echo -1)"
     if [ "$ws_uid" != "-1" ] && { [ "$ws_uid" != "$(id -u)" ] || [ "$ws_gid" != "$(id -g)" ]; }; then
@@ -16,6 +20,13 @@ if [ -d "$ROS2_WS_DIR" ]; then
             ws_uid=$1; ws_gid=$2; cur_uid=$3; cur_gid=$4; ws=$5; self=$6; shift 6
             if [ "$ws_uid" = 0 ]; then
                 chown "$cur_uid:$cur_gid" "$ws" 2>/dev/null || true
+                if [ "$(stat -c %u "$ws" 2>/dev/null)" = 0 ]; then
+                    echo "[WARN] Could not hand $ws to ubuntu (still owned by 0:0; a shared-folder mount?). Continuing as ubuntu."
+                    # Files stay editable, but git refuses a repo at $ws itself
+                    # ("dubious ownership"), so trust that one directory.
+                    git config --system --get-all safe.directory 2>/dev/null | grep -qxF "$ws" \
+                        || git config --system --add safe.directory "$ws" 2>/dev/null || true
+                fi
                 drop_uid=$cur_uid; drop_gid=$cur_gid
             else
                 # Re-map ubuntu to the workspace owner (or create a new user if needed)
@@ -27,7 +38,8 @@ if [ -d "$ROS2_WS_DIR" ]; then
                     -exec chown -h "$ws_uid:$ws_gid" {} + 2>/dev/null || true
                 drop_uid=$ws_uid; drop_gid=$ws_gid
             fi
-            exec setpriv --reuid "$drop_uid" --regid "$drop_gid" --init-groups -- "$self" "$@"
+            exec setpriv --reuid "$drop_uid" --regid "$drop_gid" --init-groups -- \
+                env ENTRYPOINT_WS_RECONCILED=1 "$self" "$@"
         ' bash "$ws_uid" "$ws_gid" "$(id -u)" "$(id -g)" "$ROS2_WS_DIR" "$0" "$@"
     fi
 fi

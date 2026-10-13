@@ -1,5 +1,11 @@
 # Change Log
 
+## [1.5.1] - 2026-10-14
+
+### Fixed
+
+- The container no longer hangs at startup on macOS with colima (virtiofs), where the mounted workspace stays owned by `0:0`. The entrypoint now tries the workspace owner reconcile only once, prints a `[WARN]`, and continues. It also marks the workspace as a git `safe.directory`, so git works in it. Takes effect from the next image build.
+
 ## [1.5.0] - 2026-10-07
 
 ### Updated
