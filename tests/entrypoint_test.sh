@@ -433,4 +433,52 @@ assert_contains "$out" "checked out release v1.0.0"
 n="$(printf '%s\n' "$out" | grep -c "Updating DNS configuration")"
 [ "$n" = "1" ] && _pass "$CURRENT_TEST" || _fail "$CURRENT_TEST" "startup ran $n times, expected 1"
 
+# =============================================================================
+# 13. A root-owned ros2_ws that can't be re-owned (colima virtiofs on macOS:
+#     every file shows as 0:0 and chown has no effect) is reconciled ONCE, then
+#     startup goes on. Before the ENTRYPOINT_WS_RECONCILED guard the entrypoint
+#     re-exec'd itself forever. Reproduced by running the entrypoint as a
+#     non-root uid: the sudo shim can't elevate, so its chown fails just like on
+#     virtiofs. setpriv is shimmed too (a non-root caller can't --init-groups).
+# =============================================================================
+base="$(make_sandbox)"
+mkdir -p "$base/ros2_ws" "$base/home"            # ros2_ws owned by root (us)
+chmod -R a+rwX "$base"
+shim13="$base/shim13"; mkdir -p "$shim13"
+cat >"$shim13/setpriv" <<'SHIM'
+#!/bin/sh
+# drop setpriv's options up to `--`, then exec the command as the same user
+while [ "$#" -gt 0 ]; do case "$1" in --) shift; break;; *) shift;; esac; done
+exec "$@"
+SHIM
+chmod +x "$shim13/setpriv"
+cp "$SHIM_DIR/sudo" "$shim13/"                   # SHIM_DIR is private to root
+
+out="$(setpriv --reuid 1000 --regid 1000 --clear-groups -- env -i \
+        HOME="$base/home" \
+        PATH="$shim13:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+        GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*' \
+        ARM64_SYSROOT="$base/sysroot" \
+        TOOLCHAINS_WS="$base/toolchains" \
+        TOOLCHAIN_API_BASE="file://$base/ghapi" \
+        GIT_CONFIG_SYSTEM="$base/gitconfig" \
+        ROS2_WS="$base/ros2_ws" \
+        PRODUCT="V2H" \
+        timeout 30 bash "$base/toolchains/entrypoint.sh" /bin/echo "CMD_SENTINEL" 2>&1)"
+
+it "13.1 the root-owned workspace is reconciled exactly once"
+n="$(printf '%s\n' "$out" | grep -c "Reconciling 'ubuntu' with workspace owner 0:0")"
+[ "$n" = "1" ] && _pass "$CURRENT_TEST" || _fail "$CURRENT_TEST" "reconciled $n times, expected 1"
+
+it "13.2 the failed hand-over is reported"
+assert_contains "$out" "Could not hand $base/ros2_ws to ubuntu"
+
+it "13.3 startup goes on and the CMD runs"
+assert_contains "$out" "Updating DNS configuration"
+assert_contains "$out" "CMD_SENTINEL"
+
+it "13.4 the workspace is trusted by git, exactly once"
+n="$(git config --file "$base/gitconfig" --get-all safe.directory 2>/dev/null | grep -cxF "$base/ros2_ws")"
+[ "$n" = "1" ] && _pass "$CURRENT_TEST" || _fail "$CURRENT_TEST" "safe.directory entries for ros2_ws: $n, expected 1"
+
 finish
