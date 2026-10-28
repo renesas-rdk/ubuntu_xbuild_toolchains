@@ -51,6 +51,8 @@ jobs:
             product: V2H
           - image: ghcr.io/renesas-rdk/rcarv4h_ubuntu_xbuild:multiarch
             product: V4H
+          - image: ghcr.io/renesas-rdk/rcarx5h_ubuntu_xbuild:multiarch
+            product: X5H
     steps:
       # The released image bundles a full Ubuntu + ROS sysroot; free headroom.
       # GitHub-hosted only — on a self-hosted host this would delete real files.

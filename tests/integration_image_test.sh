@@ -16,7 +16,7 @@
 #
 # Usage: integration_image_test.sh [IMAGE] [PRODUCT]
 #   IMAGE    default ghcr.io/renesas-rdk/rzv2h_ubuntu_xbuild:multiarch
-#   PRODUCT  V2H (default) or V4H — must match the image
+#   PRODUCT  V2H (default), V4H or X5H. Must match the image.
 #
 # Needs docker with privileged containers and (on non-arm64 hosts) QEMU binfmt
 # handlers registered. A locally present image is reused; the pull is skipped.
@@ -33,7 +33,8 @@ PRODUCT="${2:-V2H}"
 case "$PRODUCT" in
     V2H) PRODUCT_CMAKE="v2h_cross.cmake" ;;
     V4H) PRODUCT_CMAKE="v4h_cross.cmake" ;;
-    *) echo "ERROR: unknown PRODUCT '$PRODUCT' (expected V2H or V4H)" >&2; exit 2 ;;
+    X5H) PRODUCT_CMAKE="x5h_cross.cmake" ;;
+    *) echo "ERROR: unknown PRODUCT '$PRODUCT' (expected V2H, V4H or X5H)" >&2; exit 2 ;;
 esac
 
 if ! command -v docker >/dev/null 2>&1; then

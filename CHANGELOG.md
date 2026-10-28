@@ -1,5 +1,11 @@
 # Change Log
 
+## [1.6.0] - 2026-10-28
+
+### Added
+
+- R-Car X5H support: new `x5h_cross.cmake` toolchain file, selected with `PRODUCT=X5H`.
+
 ## [1.5.1] - 2026-10-14
 
 ### Fixed
