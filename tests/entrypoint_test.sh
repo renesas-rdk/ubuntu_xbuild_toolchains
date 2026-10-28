@@ -126,6 +126,7 @@ set_latest_release() {
 
 # run_entry BASE [CMD...] — run the entrypoint from the sandbox with a hermetic
 # env, ending in CMD (default: print a startup sentinel). Captures stdout+stderr.
+# The board is PRODUCT=V2H unless ENTRY_PRODUCT overrides it (case 14).
 # The timeout is a backstop: the entrypoint re-execs itself when a release
 # rewrites it (case 11), so a regression that made that loop would otherwise
 # hang the whole suite instead of failing the case.
@@ -140,7 +141,7 @@ run_entry() {
         TOOLCHAINS_WS="$tc" \
         TOOLCHAIN_API_BASE="file://$base/ghapi" \
         ROS2_WS="$base/no_ros2_ws" \
-        PRODUCT="V2H" \
+        PRODUCT="${ENTRY_PRODUCT:-V2H}" \
         timeout 120 bash "$tc/entrypoint.sh" "$@" 2>&1
 }
 
@@ -480,5 +481,34 @@ assert_contains "$out" "CMD_SENTINEL"
 it "13.4 the workspace is trusted by git, exactly once"
 n="$(git config --file "$base/gitconfig" --get-all safe.directory 2>/dev/null | grep -cxF "$base/ros2_ws")"
 [ "$n" = "1" ] && _pass "$CURRENT_TEST" || _fail "$CURRENT_TEST" "safe.directory entries for ros2_ws: $n, expected 1"
+
+# =============================================================================
+# 14. Each board's PRODUCT selects its own toolchain file. After a release is
+#     checked out, the entrypoint copies <product>_cross.cmake over cross.cmake.
+#     The case switches through every board on one sandbox, so it also catches
+#     a stale cross.cmake left by the previous board.
+# =============================================================================
+base="$(make_sandbox)"
+( cd "$base/toolchains" || exit 1
+  cp "$REPO/v2h_cross.cmake" "$REPO/v4h_cross.cmake" "$REPO/x5h_cross.cmake" \
+     "$REPO/.gitignore" .
+  git add -A >/dev/null
+  git "${GIT_ID[@]}" commit -qm add-product-cmake
+  git push -q origin main >/dev/null 2>&1 )
+
+minor=0
+for product in V2H V4H X5H; do
+    cmake_file="$(printf '%s' "$product" | tr '[:upper:]' '[:lower:]')_cross.cmake"
+    tag_remote "$base" "v1.$minor.0" "release-$product"
+    set_latest_release "$base" "v1.$minor.0"
+    minor=$((minor + 1))
+
+    out="$(ENTRY_PRODUCT="$product" run_entry "$base")"
+
+    it "14.$minor PRODUCT=$product makes cross.cmake a copy of $cmake_file"
+    assert_contains "$out" "--- Startup Complete ---"
+    cmp -s "$base/toolchains/$cmake_file" "$base/toolchains/cross.cmake" \
+        && _pass "$CURRENT_TEST" || _fail "$CURRENT_TEST" "cross.cmake does not match $cmake_file"
+done
 
 finish

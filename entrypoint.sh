@@ -196,6 +196,7 @@ if [ -d "$TOOLCHAIN_DIR/.git" ]; then
     case "$product" in
       V2H) [ -f v2h_cross.cmake ] && cp v2h_cross.cmake cross.cmake;;
       V4H) [ -f v4h_cross.cmake ] && cp v4h_cross.cmake cross.cmake;;
+      X5H) [ -f x5h_cross.cmake ] && cp x5h_cross.cmake cross.cmake;;
     esac
 
     echo "[INFO] Toolchain synchronized."

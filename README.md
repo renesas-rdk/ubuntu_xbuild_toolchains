@@ -20,6 +20,7 @@ AI use cases.
 | --- | --- | --- | --- |
 | **RZ/V2H RDK** | Cortex-A55 | `v2h_cross.cmake` | `V2H` (default) |
 | **RCar/V4H Sparrow Hawk** | Cortex-A76 | `v4h_cross.cmake` | `V4H` |
+| **RCar/X5H EVB** | Cortex-A720AE | `x5h_cross.cmake` | `X5H` |
 
 The container selects the active board from the `PRODUCT` environment variable
 (defaults to `V2H`). On start, the entrypoint copies the matching
@@ -48,7 +49,7 @@ applications for the target board.
 
 | File | Purpose |
 | --- | --- |
-| `v2h_cross.cmake`, `v4h_cross.cmake` | CMake toolchain files (per-board compiler flags, sysroot, `rpath-link` fixups). One is copied to `cross.cmake` based on `PRODUCT`. |
+| `v2h_cross.cmake`, `v4h_cross.cmake`, `x5h_cross.cmake` | CMake toolchain files (per-board compiler flags, sysroot, `rpath-link` fixups). One is copied to `cross.cmake` based on `PRODUCT`. |
 | `cross-colcon-build.sh` | `colcon build` wrapper that injects the toolchain + Python paths into `--cmake-args`. Installed as `cross-colcon-build`. |
 | `arm64-chroot.sh` | Enters the ARM64 sysroot via QEMU + `chroot` (used to run `rosdep`/`apt` against the target). |
 | `sysroot-rosdep-install.sh` | Copies the ROS 2 workspace into the sysroot and installs build-time dependencies with `rosdep`. |
@@ -64,8 +65,9 @@ For full setup and development instructions, see the
 [Application Development Guide](https://renesas-rdk.github.io/rzv2h_rdk_documentation/latest/chapter-4/development_guide/development_guide.html).
 
 > Note: the hosted guides above are written for the RZ/V2H RDK. The
-> cross-build workflow is the same for the RCar/V4H Sparrow Hawk; set
-> `PRODUCT=V4H` and use the `v4h_cross.cmake` toolchain.
+> cross-build workflow is the same for the RCar/V4H Sparrow Hawk and the
+> RCar/X5H EVB. Set `PRODUCT=V4H` to use `v4h_cross.cmake`, or `PRODUCT=X5H`
+> to use `x5h_cross.cmake`.
 
 ## Troubleshooting
 

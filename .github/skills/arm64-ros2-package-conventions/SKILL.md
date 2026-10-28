@@ -123,7 +123,8 @@ Guidance:
   imported at runtime.
 - Board-specific deps carry `condition="$PRODUCT == 'V4H'"` or
   `condition="$PRODUCT == 'V2H'"` on the dependency tag; those are the
-  only two forms used in this tree.
+  only two forms used in this tree so far. The R-Car X5H container sets
+  `PRODUCT=X5H`, so an X5H-only dep uses `condition="$PRODUCT == 'X5H'"`.
 - Use the **canonical rosdep key** (e.g. `libopencv-dev`,
   `boost`) — not a Debian-only package name. Check
   <https://github.com/ros/rosdistro/blob/master/rosdep/base.yaml>
